@@ -1,0 +1,41 @@
+{
+  "name": "@dsh-external/dsh-prompt-enhancer",
+  "version": "0.1.0",
+  "description": "提示词增强插件:输入框注入强化/还原图标,后台调用隔离 agent 结合对话上下文与仓库知识重写提示词,替换草稿文本",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "package.json"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "prompt-enhancer",
+    "plugin"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "bash scripts/build.sh",
+    "build:client": "node scripts/build-client.mjs"
+  }
+}
