@@ -30,6 +30,7 @@ dsh plugin --profile web add github:Vinzelles/dsh-prompt-enhancer
 | 高 | 充分展开背景/步骤/验收（≤3 倍原文），参考文件带说明 |
 
 还可以给强化单独指定模型（provider → model → 思考强度三级联动），不配置则跟随会话默认模型；配置即时生效，无需重启。
+建议设置轻量快速的模型，避免强化消耗过多token或是耗费时间过长。
 
 ## 值得信任的地方
 
