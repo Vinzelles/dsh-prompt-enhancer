@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-prompt-enhancer",
-  "version": "0.1.0",
-  "description": "提示词增强插件:输入框注入强化/还原图标,后台调用隔离 agent 结合对话上下文与仓库知识重写提示词,替换草稿文本",
+  "version": "0.1.1",
+  "description": "提示词增强插件:输入框注入强化/还原图标,后台调用隔离 agent 结合对话上下文与仓库知识重写提示词,替换草稿文本(保留 skill 引用记号)",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -36,6 +36,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
-    "build:client": "node scripts/build-client.mjs"
+    "build:client": "node scripts/build-client.mjs",
+    "test:promo-copy": "node --test tests/promo-copy-check.test.mjs"
   }
 }

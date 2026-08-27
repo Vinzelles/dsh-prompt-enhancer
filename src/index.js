@@ -5,15 +5,23 @@
  * 服务端结合有界对话窗口 + 会话工作目录(仓库知识),把原始提示词
  * 重写为结构化的 agent 任务提示词并附参考文件清单。
  *
- * 执行通道(ADR-0001):
- *   通道 B(主):隔离子会话 agent(继承父会话工具组合 + 只读工具限制 +
- *              强化专用 persona),完整 agent 循环,结果回传后 dispose,
- *              不污染主对话历史。
+ * 执行通道(ADR-0001,2026-08-21 修订:通道 B 二级降级):
+ *   通道 B(主):隔离子会话 agent(composeFrom 继承父会话预设组合 + 只读工具限制 +
+ *              强化专用 persona),完整 agent 循环,结果回传后 dispose,不污染主对话历史。
+ *              父预设若携带与全新子会话首轮不兼容的机制(如 router 预设 bootstrap
+ *              要求平台 shell 在目录中,而只读限制已将其移除→首轮 turn 错误无文本),
+ *              退化为不 join 预设的裸子会话重试一次(纯改写、无文件检索)。
  *   通道 A(降级):ctx.llm.stream 直调,同一 persona 与 payload。
  *
  * 决策基线(grill 会话共识,详见 CONTEXT.md):
  *   窗口 ~8k token(24000 字符预算)/ 参考文件 top-5 / 摘录 ≤2 篇 × ≤20 行 /
  *   通道 B 超时 90s / 通道 A 超时 60s / 保持输入语言 / 软长度约原文 2 倍。
+ *
+ * Skill 引用保留(2026-08-22):原始提示词中的 `/skill-name` 记号是宿主技能
+ * 引用语法(dsh-tool-skill 以 SKILL_GESTURE 全文扫描用户消息后注入技能全文),
+ * 强化必须原样保留。三层保障:① 提取(与宿主同文法)随 payload 下发;
+ * ② persona 规则 9 + payload【Skill 引用】节约束改写;③ 输出缺失记号时以
+ * 「## 技能引用」节确定性回填(宿主全文扫描照样命中)。
  */
 
 const ENDPOINT = "/prompt-enhancer";
@@ -24,6 +32,10 @@ const FALLBACK_TIMEOUT_MS = 60_000;
 const CONTEXT_CHAR_BUDGET = 24_000; // ≈8k token 混合中英
 const CONTEXT_LINE_CAP = 3_000; // 单条消息折叠上限,防单条巨长消息独占窗口
 const READONLY_TOOLS = ["glob", "grep", "read"];
+/** Skill 引用记号文法(与宿主 dsh-tool-skill 的 SKILL_GESTURE 逐字符一致):
+ *  行首或空白后的 /name,name 限 kebab-case,后随空白/行尾。宿主据此识别
+ *  用户消息中的技能引用并在对话中注入技能全文;强化必须原样保留这些记号。 */
+const SKILL_GESTURE = /(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/g;
 
 import { appendFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
@@ -192,6 +204,7 @@ const ENHANCER_PERSONA = [
   "6. 参考文件清单:在输出末尾加「## 参考文件」一节,每行「- 相对路径 — 一句话相关性说明」。只列你实际用 glob/grep/read 打开并确认存在的文件,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);未找到相关文件或没有工作目录时省略该节。",
   "7. 摘录:最多对 2 个「高相关且短」的文件在清单后附 ≤20 行关键摘录;其余文件只给路径与说明。",
   "8. 输出格式:只输出改写后的提示词本身(含参考文件节);禁止输出任何解释、前言、确认语或代码围栏。",
+  "9. Skill 引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「## 技能引用」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
 ].join("\n");
 
 export const name = "@dsh-external/dsh-prompt-enhancer";
@@ -265,6 +278,9 @@ async function handleRoute(ctx, request, response) {
       respondJson(response, 400, { error: "sessionId 与 draft 为必填项" });
       return;
     }
+    // Skill 引用提取(与宿主同文法):供 payload 约束与输出兜底校验
+    const referencedSkills = extractSkillNames(draft);
+    if (referencedSkills.length > 0) diagLog("skill-refs-extracted", { sessionId, skills: referencedSkills });
     const source = await readSource(ctx, sessionId);
     const route = await routeOf(ctx, sessionId, source.events);
     const resolved = cwdOf(ctx, sessionId, source.events, clientCwd);
@@ -280,7 +296,7 @@ async function handleRoute(ctx, request, response) {
       model: cfg.model ?? null,
     });
     const context = boundedContext(source.events);
-    const payload = buildPayload(draft, context, cwd, cfg.intensity);
+    const payload = buildPayload(draft, context, cwd, cfg.intensity, referencedSkills);
 
     let enhanced;
     try {
@@ -304,10 +320,24 @@ async function handleRoute(ctx, request, response) {
       diagLog("enhance-refs-sanitized", { sessionId, removed: sanitized.removed, cwd: cwd ?? null });
       enhanced = sanitized.text;
     }
+    // Skill 引用兜底:输出丢失记号时确定性回填「## 技能引用」节
+    if (referencedSkills.length > 0) {
+      const restored = ensureSkillReferences(enhanced, referencedSkills);
+      if (restored.added > 0) {
+        diagLog("enhance-skills-restored", { sessionId, requested: restored.requested, added: restored.added, mode: restored.mode });
+        enhanced = restored.text;
+      }
+    }
+    const beforeIntensity = enhanced;
     // 低档强度:即使模型不听话也强制去掉文件引用
     if (cfg.intensity === "low") {
       enhanced = stripReferences(enhanced);
-      diagLog("enhance-intensity-low", { sessionId, stripped: enhanced !== sanitized.text });
+      diagLog("enhance-intensity-low", { sessionId, stripped: enhanced !== beforeIntensity });
+    } else if (cfg.intensity === "medium") {
+      // 中档强度:即使模型不听话也强制压缩参考节(只留路径、去说明与摘录)
+      const compacted = compactMediumReferences(enhanced);
+      diagLog("enhance-intensity-medium", { sessionId, compacted: compacted !== beforeIntensity });
+      enhanced = compacted;
     }
     respondJson(response, 200, { enhanced });
   } catch (error) {
@@ -398,6 +428,17 @@ async function handleModels(ctx, request, response) {
     const message = error instanceof Error ? error.message : String(error);
     respondJson(response, 502, { error: message });
   }
+}
+
+function truncateJson(value, cap) {
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  if (typeof text !== "string") return text;
+  return text.length > cap ? text.slice(0, cap) + "…(truncated)" : text;
 }
 
 /* ═══════════════ 会话读取 ═══════════════ */
@@ -504,7 +545,7 @@ function textOfBlocks(blocks) {
     .join("\n");
 }
 
-function buildPayload(draft, context, cwd, intensity) {
+function buildPayload(draft, context, cwd, intensity, skills = []) {
   const parts = [];
   if (typeof cwd === "string" && cwd !== "") {
     parts.push("【工作目录】\n" + cwd + "\n(参考文件路径一律使用相对该目录的路径;检索只用 glob/grep/read,不要遍历全仓。)");
@@ -515,14 +556,72 @@ function buildPayload(draft, context, cwd, intensity) {
     parts.push("【对话上下文(最近窗口,用于保持话题与约束连续性)】\n" + context);
   }
   parts.push("【原始提示词(强化对象)】\n" + draft);
+  if (skills.length > 0) {
+    parts.push("【Skill 引用(必须原样保留)】\n上面的原始提示词包含以下宿主技能引用记号:/"
+      + skills.join("、/")
+      + "\n它们不是普通文字:宿主会扫描消息中的这些记号并注入对应技能的完整说明。强化结果必须逐字符保留每个记号(连斜杠),可融入正文或集中在「## 技能引用」节;禁止翻译、改写成描述性词语、加代码围栏或省略任何一个。");
+  }
   let tail = "按你的系统指令强化上面的原始提示词;只输出强化后的提示词。";
   if (intensity === "low") {
     tail += "\n\n【本次强度:低】只做必要的措辞与结构润色,保持最接近原文的篇幅;禁止扩写、禁止引用任何文件路径、禁止输出「## 参考文件」清单。";
+  } else if (intensity === "medium") {
+    tail += "\n\n【本次强度:中】压缩输出:主体保持紧凑,通常不超过原文的 1.5 倍,不要为凑结构注水;「## 参考文件」节每行只列相对路径(不带「— 说明」后缀),最多 5 个文件;禁止附任何文件摘录或代码片段。";
   } else if (intensity === "high") {
     tail += "\n\n【本次强度:高】在不改变用户意图的前提下,允许适度展开背景、步骤与验收细节(通常不超过原文的 3 倍);参考文件节照常输出。";
   }
   parts.push(tail);
   return parts.join("\n\n");
+}
+
+/** 中档强度兜底:「## 参考文件」节内每行只保留路径(剥离「— 说明」),删除说明行、摘录与代码块;
+ *  整节无有效清单行时删除整节(含标题)。只作用于中档(宿主强制,保证即使模型不听话输出也保持紧凑);低/高档不受影响。 */
+function compactMediumReferences(text) {
+  const lines = String(text).split("\n");
+  const out = [];
+  let inRefs = false;
+  let inFence = false;
+  let refsHeadingIndex = -1;
+  let sectionEndIndex = -1; // 节内容在 out 中的结束位置(遇到下一标题或输入结束时落定)
+  let keptListLines = 0;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (inRefs && trimmed.startsWith("```")) {
+      inFence = !inFence;
+      continue; // 节内代码块(摘录)连同围栏删除
+    }
+    if (!inRefs && /^##\s*参考文件/i.test(trimmed)) {
+      inRefs = true;
+      refsHeadingIndex = out.length;
+      out.push(line);
+      continue;
+    }
+    if (inRefs && !inFence && /^#{1,6}\s/.test(trimmed)) {
+      inRefs = false; // 参考节结束(下一个标题)
+      sectionEndIndex = out.length;
+      out.push(line);
+      continue;
+    }
+    if (inRefs) {
+      if (inFence) continue; // 代码块内容(摘录)删除
+      const match = /^\s*[-*]\s+`?([^`\s][^`]*?)`?(?:\s+[—–-].*)?$/.exec(line);
+      if (match !== null) {
+        const candidate = match[1].trim();
+        if (candidate !== "") {
+          keptListLines += 1;
+          out.push("- " + candidate); // 只保留路径
+        }
+        continue;
+      }
+      continue; // 说明行/摘录行/空行删除
+    }
+    out.push(line);
+  }
+  if (inRefs) sectionEndIndex = out.length; // 节延续到输入末尾
+  if (sectionEndIndex > 0 && keptListLines === 0) {
+    out.splice(refsHeadingIndex, sectionEndIndex - refsHeadingIndex);
+    while (out.length > 0 && out[out.length - 1].trim() === "") out.pop();
+  }
+  return out.join("\n");
 }
 
 /** 低档强度兜底:强制删除「## 参考文件」整节(含摘录),保证输出不带任何文件引用。 */
@@ -543,8 +642,39 @@ function stripReferences(text) {
   return out.join("\n");
 }
 
-/* ═══════════════ 参考清单校验(防臆造路径) ═══════════════ */
+/* ═══════════════ Skill 引用保留 ═══════════════ */
 
+/** 从文本提取 skill 引用名。文法与宿主 dsh-tool-skill 的 SKILL_GESTURE 一致:
+ *  行首或空白后的 /name(kebab-case),后随空白或行尾——宿主据此把技能全文
+ *  注入对话。返回按首次出现顺序去重的名字列表。 */
+function extractSkillNames(text) {
+  const names = [];
+  for (const match of String(text).matchAll(SKILL_GESTURE)) {
+    const name = match[2];
+    if (name !== undefined && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/** 强化输出的 skill 引用兜底:检查增强稿是否仍含全部原始引用记号;
+ *  缺失的记号以「## 技能引用」节追加到末尾(宿主对用户消息做全文 gesture
+ *  扫描,该节同样命中)。全部保留时不添加任何内容。 */
+function ensureSkillReferences(text, names) {
+  const kept = extractSkillNames(text);
+  const missing = names.filter((name) => !kept.includes(name));
+  if (missing.length === 0) return { text, added: 0, requested: names.length, mode: "none" };
+  const section = "\n\n## 技能引用\n以下记号是宿主平台的技能(skills)调用标记,发送后会由宿主注入对应技能的完整说明,不得删除、改写或翻译:\n"
+    + missing.map((name) => "- /" + name).join("\n")
+    + "\n";
+  return {
+    text: String(text).replace(/\s*$/, "") + section,
+    added: missing.length,
+    requested: names.length,
+    mode: missing.length === names.length ? "all" : "partial",
+  };
+}
+
+/* ═══════════════ 参考清单校验(防臆造路径) ═══════════════ */
 /** 校验「## 参考文件」节:相对 cwd 解析后不存在的路径行剔除;节内路径全无效则整节删除。
  *  只校验列表行(以 - / * 开头且能提取出路径的),说明行/摘录块原样保留。 */
 function sanitizeReferences(text, cwd) {
@@ -609,22 +739,43 @@ function sanitizeReferences(text, cwd) {
 
 /* ═══════════════ 通道 B:隔离子会话 agent ═══════════════ */
 
-async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal, modelCfg) {
-  const parent = ctx.agents.get(sessionId);
+/** 跑一次强化子会话。joinPreset=true:继承父会话预设组合(composeFrom + persona +
+ * 只读限制);false:裸子会话(只注入 persona,不 join 任何预设——预设层的首轮机制
+ * 不会作用于它,退化为纯改写)。fatal 错误(超时/客户端取消)以 error.fatal 标记,
+ * 调用方不应重试;无文本/回合错误可重试。 */
+async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, joinPreset) {
   // 配置了专用模型:agentOptions 覆盖 provider/model;effort 经 agent/request waterfall 注入
   // (agent-loop 的 buildRequest 只从会话 header 继承 effort,子会话 header 无此配置)。
   const effectiveProvider = modelCfg?.provider ?? route.provider;
   const effectiveModel = modelCfg?.model ?? route.model;
   const childId = "session-" + globalThis.crypto.randomUUID();
-  const setup = parent === undefined ? undefined : (childCtx) => {
-    // 继承父会话工具组合(与 dsh-subagent applyChildComposition 同法)
+  const setup = (childCtx) => {
+    // 子代理目录身份契约:任何 origin="subagent" 的会话都必须有一条
+    // subagent/descriptor 事件,否则 dsh-subagent 的 catalog 无法折叠出子代理身份,
+    // 会把该会话判为 corrupt(界面显示「会话记录损坏」)。官方驱动
+    // (dsh-subagent-in-process-driver)在首步 pre-step 追加;本插件在创建窗口内
+    // 直接补写 one-shot descriptor,保证即使子会话被取消/无文本也带上身份。
     try {
-      const presets = childCtx.get?.("agentPresets");
-      if (presets !== undefined && typeof presets.composeFrom === "function") {
-        presets.composeFrom(childCtx, parent.ctx);
-      }
+      childCtx.agent.session.append("subagent/descriptor", {
+        version: 2,
+        mode: "one-shot",
+        provider: "prompt-enhancer",
+        label: "提示词强化",
+      });
     } catch (error) {
-      ctx.logger?.warn("[dsh-prompt-enhancer] composeFrom 失败(子会话无工具): " + String(error));
+      ctx.logger?.warn("[dsh-prompt-enhancer] subagent/descriptor 追加失败: " + String(error));
+    }
+    // 继承父会话工具组合(与 dsh-subagent applyChildComposition 同法);
+    // 裸子会话不 join 父组合——预设层的首轮监听(router bootstrap 等)不会作用于它
+    if (joinPreset) {
+      try {
+        const presets = childCtx.get?.("agentPresets");
+        if (presets !== undefined && typeof presets.composeFrom === "function") {
+          presets.composeFrom(childCtx, parent.ctx);
+        }
+      } catch (error) {
+        ctx.logger?.warn("[dsh-prompt-enhancer] composeFrom 失败(子会话无工具): " + String(error));
+      }
     }
     // 强化专用 persona 遮蔽父 persona(同名同序段)
     try {
@@ -632,11 +783,14 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
     } catch (error) {
       ctx.logger?.warn("[dsh-prompt-enhancer] systemPrompt.section 失败: " + String(error));
     }
-    // 只读工具限制(未知名失败则整体放弃限制,不阻断创建)
-    try {
-      childCtx.tools?.restrict?.({ allow: READONLY_TOOLS });
-    } catch (error) {
-      ctx.logger?.warn("[dsh-prompt-enhancer] tools.restrict 失败(退化:无工具限制): " + String(error));
+    // 只读工具限制(预设目录缺只读工具名时 restrict 抛未知名→整体放弃限制——
+    // 退化为无限制,不阻断创建;裸子会话的全局目录同样可能缺 read,同法)
+    if (joinPreset) {
+      try {
+        childCtx.tools?.restrict?.({ allow: READONLY_TOOLS });
+      } catch (error) {
+        ctx.logger?.warn("[dsh-prompt-enhancer] tools.restrict 失败(退化:无工具限制): " + String(error));
+      }
     }
     // 专用模型 + 思考强度:waterfall 覆盖请求配置(与 installModelSelection 同法)
     if (modelCfg !== undefined) {
@@ -657,7 +811,9 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
       }
     }
   };
-  const meta = { parentSession: sessionId, origin: "subagent" };
+  // 与官方 childSessionMeta 同构:origin/父会话/委派深度(父深度+1,父不可用按顶层 0 计)。
+  const parentDepth = parent?.session?.header?.delegationDepth ?? 0;
+  const meta = { parentSession: sessionId, origin: "subagent", delegationDepth: parentDepth + 1 };
   if (cwd !== undefined) meta.cwd = cwd;
   const handle = await ctx.agents.create({
     sessionId: childId,
@@ -669,7 +825,7 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
       ...(route.reasoningEffort !== undefined && modelCfg === undefined ? { reasoningEffort: route.reasoningEffort } : {}),
       ...(route.maxTokens !== undefined ? { maxTokens: route.maxTokens } : {}),
     },
-    ...(setup === undefined ? {} : { setup }),
+    setup,
   });
   const inverses = [];
   try {
@@ -678,6 +834,7 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
       childId,
       childCwd: handle.agent?.session?.header?.cwd ?? null,
       metaCwd: cwd ?? null,
+      joinPreset,
     });
     // 绑定父工作区,保证 glob/grep/read 落在仓库根上
     const workspace = (ctx.workspaceRegistry?.list?.() ?? [])
@@ -689,7 +846,26 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
     handle.agent.followup(userMessage(payload));
     await waitForTurn(handle.agent, CHILD_TIMEOUT_MS, signal, "强化子会话");
     const text = lastAssistantText(handle.agent.session.events);
-    if (text === "") throw new Error("强化子会话没有产出文本");
+    if (text === "") {
+      // 子会话回合结束却无文本:回合内部错误此前被吞掉(只读助手文本)。
+      // 把全部事件落盘诊断,并尽量从错误事件里提炼一句可读原因。
+      const events = handle.agent.session.events;
+      const digest = events.map((event) => ({ type: event?.type, data: truncateJson(event?.data, 600) }));
+      const errorEvent = [...events].reverse().find((event) => String(event?.type ?? "").includes("error"));
+      const rawCause = errorEvent === undefined ? undefined : (errorEvent.data?.error?.message ?? errorEvent.data?.message ?? errorEvent.data?.error);
+      const cause = rawCause === undefined || rawCause === null ? "" : String(rawCause);
+      diagLog("enhance-child-no-text", {
+        sessionId,
+        childId,
+        joinPreset,
+        childStatus: handle.agent?.status,
+        eventCount: events.length,
+        events: digest,
+      });
+      const error = new Error("强化子会话没有产出文本" + (cause !== "" ? "——" + cause : ""));
+      error.noText = true;
+      throw error;
+    }
     return text;
   } finally {
     for (const inverse of inverses.reverse()) {
@@ -699,6 +875,27 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
     }
     await handle.dispose();
   }
+}
+
+/** 通道 B:隔离子会话 agent。先以继承父会话预设组合的方式尝试;当父预设携带与
+ * 全新子会话首轮不兼容的机制(如 router 预设 bootstrap 要求平台 shell 在目录中,
+ * 而只读限制已将其移除——子会话首轮直接 turn 错误、无文本)时,退化为不 join
+ * 预设的裸子会话重试一次(纯改写、无文件检索——ADR-0001「无工具时 B 退化为纯
+ * 改写」语义)。致命错误(超时/客户端取消, error.fatal)不重试。 */
+async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal, modelCfg) {
+  const parent = ctx.agents.get(sessionId);
+  if (parent !== undefined) {
+    try {
+      return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, true);
+    } catch (error) {
+      if (error?.fatal === true || signal?.aborted === true) throw error;
+      // 预设组合无文本(如 router-bootstrap: no platform shell in catalog)或
+      // 子会话创建失败:裸子会话(纯改写)重试
+      ctx.logger?.warn("[dsh-prompt-enhancer] 通道 B 预设组合无产出,裸子会话重试: " + String(error?.message ?? error));
+      diagLog("enhance-child-retry-bare", { sessionId, reason: String(error?.message ?? error) });
+    }
+  }
+  return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, parent === undefined);
 }
 
 /** 等待子代理回合结束:超时(90s)与客户端取消(signal)都会 cancel 子代理。 */
@@ -717,13 +914,20 @@ async function waitForTurn(agent, timeoutMs, signal, label) {
       new Promise((_, reject) => {
         timer = setTimeout(() => {
           cancel("超时(" + timeoutMs + "ms)");
-          reject(new Error(label + "超时(" + timeoutMs + "ms)"));
+          const error = new Error(label + "超时(" + timeoutMs + "ms)");
+          error.fatal = true; // 超时不重试:裸子会话会再次挂满整个预算
+          reject(error);
         }, timeoutMs);
       }),
       signal === undefined
         ? new Promise(() => {})
         : new Promise((_, reject) => {
-            signal.addEventListener("abort", () => reject(signal.reason instanceof Error ? signal.reason : new Error(label + "被取消")), { once: true });
+            signal.addEventListener("abort", () => {
+              const error = new Error(label + "被取消");
+              error.fatal = true; // 客户端已离开,不重试
+              if (signal.reason !== undefined) error.cause = signal.reason;
+              reject(error);
+            }, { once: true });
           }),
     ]);
   } finally {

@@ -26,3 +26,19 @@
 - 正面:检索交给 agent;主历史干净;两条通道的 persona 与输出格式共享同一份定义,行为一致。
 - 负面:通道 B 需要创建/销毁临时子会话,延迟与 token 成本高于纯直调;无工具时(composeFrom 失败)B 退化为纯改写,由 A 兜底同语义。
 - 风险与缓解:子会话可能继承父预设的宽工具面 → 用 `tools.restrict({allow: [glob, grep, read]})` 收紧为只读;限制注册失败(工具名未知)时不阻断创建、仅告警退化。超时通过 `activityDone` + 定时器竞争实现,超时即 `agent.cancel` 并 dispose。
+
+## 修订(2026-08-21):通道 B 二级降级——预设组合无文本时裸子会话重试
+
+**问题**:用户会话运行在携带「首轮机制」的 agent 预设上(如 router 预设的
+`router-bootstrap`:首轮 system-prompt 组装时要求平台 shell(pwsh/bash)在工具目录中,
+否则直接 throw)时,强化子会话经 `composeFrom` join 该预设的 standing composition 后,
+其**首轮**恰是子会话自己的首轮——bootstrap 作用于子会话,而只读限制已把平台 shell
+移出目录 → 首轮 turn 以 `router-bootstrap: no platform shell in catalog` 错误终止、
+无助手文本 → 通道 B 报「没有产出文本」,通道 A 又常因本地 LLM 空响应报「LLM 无输出」,
+用户看到「强化失败」。(2026-08-21 诊断:`enhance-child-no-text` 事件落盘取证确认。)
+
+**决策**:通道 B 失败(非超时、非客户端取消)且无文本时,以**不 join 预设的裸子会话**
+重试一次:不 `composeFrom`、不 `restrict`,只注入强化 persona(与专用模型 waterfall)。
+裸子会话不落在任何预设 scope 下,预设层首轮监听不作用于它,退化为纯改写(无文件检索)——
+正是本 ADR 既有的「无工具时 B 退化为纯改写」语义。超时/客户端取消为致命错误,不重试
+(避免双倍预算);重试后仍无文本则按原路径降级通道 A。

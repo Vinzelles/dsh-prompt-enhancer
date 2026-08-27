@@ -10,3 +10,5 @@
 8. 设置 → 插件 → 插件配置出现「提示词强化」卡片：模型下拉含「跟随会话默认」+ 全部 provider/模型/思考强度；强度三档可切换；保存后写 settings 文档。
 9. 强度设为「低」后强化：输出精简且不含「## 参考文件」节；「中」仅列参考路径；「高」恢复完整引用（路径 + 说明）。
 10. 配置专用模型后强化：diag log `enhance-start` 的 `model` 字段与宿主 `debug-stream.log` 的 `buildRequest done: provider=..., model=...` 显示该模型。
+11. 运行在非标准 agent 预设上的会话点击强化不报错（2026-08-21 回归）：父预设首轮机制与子会话不兼容时（diag log `enhance-child-no-text` 后出现 `enhance-child-retry-bare`），无预设子会话自动重试成功，toast 不再出现「LLM 无输出」；标准/code 等无首轮机制预设首轮即成功（无 retry 记录）。
+12. 草稿含 skill 引用（如 `/tdd`、`/code-review`）时强化：增强稿仍保留全部记号；模型改写致缺失时末尾出现「## 技能引用」节列出缺失记号（diag log 先后出现 `skill-refs-extracted` 与 `enhance-skills-restored`），发送后宿主照常注入技能全文。无引用的草稿强化结果不含该节。低/中/高三档强度下引用均不丢失。
