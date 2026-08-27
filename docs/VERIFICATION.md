@@ -11,5 +11,6 @@
 9. 强度设为「低」后强化：输出精简且不含「## 参考文件」节；「中」仅列参考路径；「高」恢复完整引用（路径 + 说明）。
 10. 配置专用模型后强化：diag log `enhance-start` 的 `model` 字段与宿主 `debug-stream.log` 的 `buildRequest done: provider=..., model=...` 显示该模型。
 11. 运行在非标准 agent 预设上的会话点击强化不报错（2026-08-21 回归）：父预设首轮机制与子会话不兼容时（diag log `enhance-child-no-text` 后出现 `enhance-child-retry-bare`），无预设子会话自动重试成功，toast 不再出现「LLM 无输出」；标准/code 等无首轮机制预设首轮即成功（无 retry 记录）。
-14. 截断检测（2026-08-27）：任一通道输出被 maxTokens 截断时——通道 A（llm 直调）捕获 finish 块 `reason.kind === "max-tokens"`；通道 B（子会话）由 `childOutputTruncated` 判定最终文本来源步的 finish 块——响应 JSON 携带 `truncated: true`，UI 弹显式告警 toast（增强稿仍替换、「还原 ↺」可用），host 落 `enhance-truncated` 信标（含通道与草稿长度）、client 落同名信标。未截断时响应无 `truncated` 字段、UI 无告警（1–13 项行为不变）。
 13. 访问控制（2026-08-27）：非本机来源（非 `127.0.0.1`/`::1`/`::ffff:127.0.0.1`）调用 `/prompt-enhancer`、`/prompt-enhancer/models`、`/prompt-enhancer/diag` 任一端点，立即 403 且不执行业务逻辑（diag log 落 `foreign-request-rejected` 信标含来源地址）；本机来源一切行为正常（1–12 项全部成立）。缺失 socket 信息按非本机处理（fail-closed）。
+14. 截断检测（2026-08-27）：任一通道输出被 maxTokens 截断时——通道 A（llm 直调）捕获 finish 块 `reason.kind === "max-tokens"`；通道 B（子会话）由 `childOutputTruncated` 判定最终文本来源步的 finish 块——响应 JSON 携带 `truncated: true`，UI 弹显式告警 toast（增强稿仍替换、「还原 ↺」可用），host 落 `enhance-truncated` 信标（含通道与草稿长度）、client 落同名信标。未截断时响应无 `truncated` 字段、UI 无告警（1–13 项行为不变）。
+15. 草稿上限与意图分类（2026-08-27）：草稿超过 200000 字符时端点立即 400（错误信息含上限值，diag log 落 `enhance-draft-too-long`），不发起任何 LLM 调用；恰好 200000 字符正常处理。persona 规则 10（意图先行）：增强稿按意图类别组织（排查/实现/解释/简单问答四分类），缺关键背景时不发明事实而是写「结合项目代码/日志确认……」，一句话多问题拆编号子问题，原话已完整清晰时只做最小必要改写。
