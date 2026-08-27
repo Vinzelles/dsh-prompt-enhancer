@@ -150,11 +150,16 @@ window.__ModuleLoader__.load({
             if (!res.ok || typeof data.enhanced !== "string" || data.enhanced.trim() === "") {
               throw new Error(typeof data.error === "string" && data.error !== "" ? data.error : "HTTP " + res.status);
             }
+            // 截断不静默:输出被 maxTokens 截断时显式告警(复用错误 toast 通道,
+            // 草稿仍替换、还原入口可用),并落客户端信标
+            const truncated = data.truncated === true;
             store.update((state) => {
               state.original = draft;
               state.enhanced = data.enhanced;
+              if (truncated) state.error = t("truncatedWarning");
             });
             inputActions.setDraft(data.enhanced);
+            if (truncated) beacon("enhance-truncated", { draftLength: draft.length });
           } catch (err) {
             if (abort.signal.aborted) return; // 用户取消:静默
             const message = err instanceof Error ? err.message : String(err);
@@ -576,6 +581,7 @@ window.__ModuleLoader__.load({
       enhance: "强化提示词",
       restore: "还原为原始提示词",
       enhanceFailed: "强化失败",
+      truncatedWarning: "⚠ 强化输出被截断（达到 maxTokens 上限）：增强稿可能不完整、参考文件可能缺失，如不合适请点还原。",
       enhancing: "正在强化提示词…",
       cancel: "取消",
       settingsTitle: "提示词强化",
@@ -607,6 +613,7 @@ window.__ModuleLoader__.load({
       enhance: "Enhance prompt",
       restore: "Restore original prompt",
       enhanceFailed: "Enhancement failed",
+      truncatedWarning: "⚠ Enhanced output was truncated (max tokens reached): the draft may be incomplete. Use restore if it looks cut off.",
       enhancing: "Enhancing prompt…",
       cancel: "Cancel",
       settingsTitle: "Prompt Enhancer",
