@@ -1,7 +1,7 @@
 // Skill 引用保留功能的行为测试(从 src/index.js 截取纯函数段执行)
 import { readFileSync } from "node:fs";
 
-const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8");
+const src = readFileSync(new URL("../src/index.js", import.meta.url), "utf8").replace(/\r\n/g, "\n"); // CRLF 归一:工作区行尾不锁定截取 marker
 
 function slice(startMarker, endMarker) {
   const start = src.indexOf(startMarker);

@@ -12,3 +12,4 @@
 10. 配置专用模型后强化：diag log `enhance-start` 的 `model` 字段与宿主 `debug-stream.log` 的 `buildRequest done: provider=..., model=...` 显示该模型。
 11. 运行在非标准 agent 预设上的会话点击强化不报错（2026-08-21 回归）：父预设首轮机制与子会话不兼容时（diag log `enhance-child-no-text` 后出现 `enhance-child-retry-bare`），无预设子会话自动重试成功，toast 不再出现「LLM 无输出」；标准/code 等无首轮机制预设首轮即成功（无 retry 记录）。
 12. 草稿含 skill 引用（如 `/tdd`、`/code-review`）时强化：增强稿仍保留全部记号；模型改写致缺失时末尾出现「## 技能引用」节列出缺失记号（diag log 先后出现 `skill-refs-extracted` 与 `enhance-skills-restored`），发送后宿主照常注入技能全文。无引用的草稿强化结果不含该节。低/中/高三档强度下引用均不丢失。
+13. 访问控制（2026-08-27）：非本机来源（非 `127.0.0.1`/`::1`/`::ffff:127.0.0.1`）调用 `/prompt-enhancer`、`/prompt-enhancer/models`、`/prompt-enhancer/diag` 任一端点，立即 403 且不执行业务逻辑（diag log 落 `foreign-request-rejected` 信标含来源地址）；本机来源一切行为正常（1–12 项全部成立）。缺失 socket 信息按非本机处理（fail-closed）。

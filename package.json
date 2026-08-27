@@ -37,6 +37,8 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "build:client": "node scripts/build-client.mjs",
+    "test": "node --test tests/loopback.test.mjs && node tests/skill-ref.test.mjs && node --test tests/promo-copy-check.test.mjs",
+    "test:unit": "node --test tests/loopback.test.mjs && node tests/skill-ref.test.mjs",
     "test:promo-copy": "node --test tests/promo-copy-check.test.mjs"
   }
 }
