@@ -242,7 +242,11 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: "exact",
     path: DIAG_ENDPOINT,
-    handler: (request, response) => {
+handler: (request, response) => {
+      if (!isLoopbackRequest(request)) {
+        rejectForeign(request, response);
+        return;
+      }
       requestJson(request).then((body) => {
         diagLog(String(body.stage ?? "unknown"), { ua: String(request.headers?.["user-agent"] ?? "").slice(0, 80), detail: body.detail });
         respondJson(response, 200, { ok: true });
@@ -256,7 +260,33 @@ export function apply(ctx) {
 
 /* ═══════════════ HTTP ═══════════════ */
 
+/** 回环来源白名单(fail-closed:其余地址——含缺失 socket——一律拒绝)。
+ *  DSH web 服务经局域网/隧道/反代暴露时(远程使用常见),三端点不得被非本机
+ *  来源触达:enhance 端点可借任意 sessionId 触发子代理在用户仓库做检索并
+ *  消耗 LLM 额度;diag/models 泄漏本机信息。非本机来源 → 403 立即拒绝。 */
+const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+
+/** 请求是否来自本机回环(纯函数:仅看 socket.remoteAddress,便于单测)。 */
+function isLoopbackRequest(request) {
+  const address = request?.socket?.remoteAddress;
+  return typeof address === "string" && LOOPBACK_ADDRESSES.has(address);
+}
+
+/** 统一访问控制闸:非本机来源 → 403(不返回业务错误信息),落盘信标供取证。 */
+function rejectForeign(request, response) {
+  const address = request?.socket?.remoteAddress;
+  diagLog("foreign-request-rejected", {
+    address: typeof address === "string" ? address : "unknown",
+    method: typeof request?.method === "string" ? request.method : "?",
+  });
+  respondJson(response, 403, { error: "Forbidden" });
+}
+
 async function handleRoute(ctx, request, response) {
+  if (!isLoopbackRequest(request)) {
+    rejectForeign(request, response);
+    return;
+  }
   // 客户端取消联动:客户端真正断开 = 响应连接关闭且未写完,或请求上传中止。
   // 注意不能用 request.on("close"):请求体读完后正常也会触发(误判)。
   const aborted = new AbortController();
@@ -381,6 +411,10 @@ function respondJson(response, status, value) {
 /** GET /prompt-enhancer/models:枚举已配置 provider 及其模型(含思考强度目录)。
  *  形状与 dsh-host-apiproxy 的 buildModelCatalog 一致,便于 client 直接消费。 */
 async function handleModels(ctx, request, response) {
+  if (!isLoopbackRequest(request)) {
+    rejectForeign(request, response);
+    return;
+  }
   try {
     if (request.method !== "GET") {
       respondJson(response, 405, { error: "仅支持 GET" });
