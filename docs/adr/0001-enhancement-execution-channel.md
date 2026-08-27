@@ -55,3 +55,18 @@
 本机连接的 remoteAddress 归一形态),其余地址与缺失 socket 一律 403(fail-closed),不返回
 业务错误信息;来源 IP 以 `foreign-request-rejected` 信标落盘取证。权衡:经远程方式浏览 DSH
 web 的用户在远端页面使用强化按钮将不可用(端点只认服务所在机的回环)——安全优先,有意取舍。
+
+## 修订(2026-08-27):双通道输出截断检测——截断不得静默覆盖草稿
+
+**问题**:两通道都可能被 `maxTokens` 截断:通道 A 的 finish chunk `reason.kind ===
+"max-tokens"` 此前未处理(只处理 `error`);通道 B 子会话的最终文本若在某一步被输出上限截断,
+同样无信号。截断损坏的提示词(正文半截、参考文件节缺半边)被静默替换进输入框,用户无从知晓。
+(竞品参照:LCQ-1024 有 `truncated` 标志 + UI 尾注;Fishsb 有截断检测 + 参考节修复。)
+
+**决策**:两通道统一产 `truncated` 布尔——通道 A 在流式消费中捕获 `max-tokens` 终态;通道 B
+以纯函数 `childOutputTruncated` 读取子会话事件流:取与最终文本同源的事件(最后一个有非空文本
+的 `assistant/message`),向前找其紧邻的 `assistant/chunk` finish 块(`data.chunk` 为 LLM 原始
+chunk,实测与 message seq 相邻),`reason.kind === "max-tokens"` 即该步被截断(未知情形不误报,
+fail-open 到无告警)。截断时响应携带 `truncated: true`,客户端弹显式告警 toast(草稿仍替换、
+「还原 ↺」入口保持可用),两端口分别落 `enhance-truncated` 信标(host 记通道与草稿长度,
+client 记客户端侧确认)。UI 零功能破坏:不改动隔离子会话执行模型、skill 引用保留与单级还原。

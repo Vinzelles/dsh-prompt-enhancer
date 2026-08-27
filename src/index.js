@@ -328,9 +328,15 @@ async function handleRoute(ctx, request, response) {
     const context = boundedContext(source.events);
     const payload = buildPayload(draft, context, cwd, cfg.intensity, referencedSkills);
 
+    // 截断标记:两通道输出都可能被 maxTokens 截断;截断时 UI 显式告警
+    // (草稿仍替换、还原入口可用)——截断损坏的提示词不得静默覆盖输入框
+    let truncated = false;
+    let channel = "child";
     let enhanced;
     try {
-      enhanced = await enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, aborted.signal, cfg.model);
+      const result = await enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, aborted.signal, cfg.model);
+      enhanced = result.text;
+      truncated = result.truncated === true;
     } catch (error) {
       if (aborted.signal.aborted) {
         diagLog("enhance-aborted", { sessionId });
@@ -342,7 +348,10 @@ async function handleRoute(ctx, request, response) {
         stack: String(error?.stack ?? "").slice(0, 800),
       });
       ctx.logger?.warn("[dsh-prompt-enhancer] 通道 B(子会话)失败,降级通道 A(llm 直调): " + String(error));
-      enhanced = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model);
+      channel = "llm";
+      const result = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model);
+      enhanced = result.text;
+      truncated = result.truncated === true;
     }
     // 防臆造路径:参考清单逐行校验存在性
     const sanitized = sanitizeReferences(enhanced, cwd);
@@ -369,7 +378,8 @@ async function handleRoute(ctx, request, response) {
       diagLog("enhance-intensity-medium", { sessionId, compacted: compacted !== beforeIntensity });
       enhanced = compacted;
     }
-    respondJson(response, 200, { enhanced });
+    if (truncated) diagLog("enhance-truncated", { sessionId, channel, draftLength: draft.length });
+    respondJson(response, 200, { enhanced, ...(truncated ? { truncated: true } : {}) });
   } catch (error) {
     if (aborted.signal.aborted) return; // 客户端已断开,静默
     const message = error instanceof Error ? error.message : String(error);
@@ -900,7 +910,7 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
       error.noText = true;
       throw error;
     }
-    return text;
+    return { text, truncated: childOutputTruncated(handle.agent.session.events) };
   } finally {
     for (const inverse of inverses.reverse()) {
       try {
@@ -981,6 +991,26 @@ function lastAssistantText(events) {
   }
   return "";
 }
+/** 子会话最终文本的来源步是否被 maxTokens 截断(纯函数:单测)。
+ *  会话事件流按步记录:先 assistant/chunk 的 finish 块(data.chunk 为 LLM 原始
+ *  chunk,含 reason.kind),随后该步对应的 assistant/message(实测 seq 相邻)。
+ *  取与 lastAssistantText 同源的事件(最后一个有非空文本的 assistant/message),
+ *  向前找其紧邻的 finish 块:reason.kind === "max-tokens" 即该步输出被输出上限截断。 */
+function childOutputTruncated(events) {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event?.type !== "assistant/message") continue;
+    if (cleanAssistantText(textOfBlocks(event.data?.message?.content)).trim() === "") continue;
+    for (let j = i - 1; j >= 0; j -= 1) {
+      const chunkEvent = events[j];
+      if (chunkEvent?.type === "assistant/chunk" && chunkEvent?.data?.chunk?.type === "finish") {
+        return chunkEvent.data.chunk.reason?.kind === "max-tokens";
+      }
+    }
+    return false;
+  }
+  return false;
+}
 
 /** 剔除模型文本中的伪工具调用块(各种常见方言)。 */
 function cleanAssistantText(text) {
@@ -999,6 +1029,7 @@ function cleanAssistantText(text) {
 
 async function enhanceWithLlm(ctx, route, payload, signal, modelCfg) {
   let text = "";
+  let truncated = false;
   const provider = modelCfg?.provider ?? route.provider;
   const model = modelCfg?.model ?? route.model;
   const reasoningEffort =
@@ -1020,12 +1051,13 @@ async function enhanceWithLlm(ctx, route, payload, signal, modelCfg) {
       if (chunk?.type === "finish" && chunk.reason?.kind === "error") {
         throw new Error(chunk.reason?.failure?.message ?? "LLM 调用失败");
       }
+      if (chunk?.type === "finish" && chunk.reason?.kind === "max-tokens") truncated = true;
     }
   })();
   await withTimeout(consume, FALLBACK_TIMEOUT_MS, undefined);
   const trimmed = cleanAssistantText(text).trim();
   if (trimmed === "") throw new Error("LLM 无输出");
-  return trimmed;
+  return { text: trimmed, truncated };
 }
 
 /* ═══════════════ 工具函数 ═══════════════ */
