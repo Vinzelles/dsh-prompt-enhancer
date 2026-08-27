@@ -37,6 +37,15 @@ const READONLY_TOOLS = ["glob", "grep", "read"];
  *  用户消息中的技能引用并在对话中注入技能全文;强化必须原样保留这些记号。 */
 const SKILL_GESTURE = /(^|\s)\/([a-z0-9]+(?:-[a-z0-9]+)*)(?=\s|$)/g;
 
+/** 草稿长度上限:超长(如整文件/大日志粘贴)请求立即 400 拒绝,
+ *  防止上下文窗口与请求体积失控。 */
+const MAX_DRAFT_CHARS = 200_000;
+
+/** 草稿超限时返回 400 错误信息,否则 null(纯函数:单测)。 */
+function draftLimitError(draft) {
+  return draft.length > MAX_DRAFT_CHARS ? "草稿超过长度上限(" + MAX_DRAFT_CHARS + " 字符)" : null;
+}
+
 import { appendFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -204,7 +213,8 @@ const ENHANCER_PERSONA = [
   "6. 参考文件清单:在输出末尾加「## 参考文件」一节,每行「- 相对路径 — 一句话相关性说明」。只列你实际用 glob/grep/read 打开并确认存在的文件,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);未找到相关文件或没有工作目录时省略该节。",
   "7. 摘录:最多对 2 个「高相关且短」的文件在清单后附 ≤20 行关键摘录;其余文件只给路径与说明。",
   "8. 输出格式:只输出改写后的提示词本身(含参考文件节);禁止输出任何解释、前言、确认语或代码围栏。",
-  "9. Skill 引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「## 技能引用」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
+  "9. Skill引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「## 技能引用」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
+  "10. 意图先行:先判断原始提示词的意图类别再组织输出,不机械套用固定模板——排查类(为什么/异常):运行环境与上下文→实际现象→预期行为→需重点核查的方向→要求根本原因与可执行修复步骤;实现类(帮我做/加/改):目标与交付物→技术栈与约束→执行步骤→验收标准;解释/方案类:话题范围与目标读者→需覆盖的维度→依据、例子或对比;简单问答/闲聊:保留原长,只做必要澄清,不过度膨胀。不发明事实:缺关键背景时写成「结合项目代码/日志确认……」由执行者自行核实;一句话含多个问题时拆成编号子问题;原话已完整清晰时只做最小必要改写,不要为改而改。",
 ].join("\n");
 
 export const name = "@dsh-external/dsh-prompt-enhancer";
@@ -306,6 +316,13 @@ async function handleRoute(ctx, request, response) {
     const clientCwd = typeof body.cwd === "string" && body.cwd !== "" ? body.cwd : undefined;
     if (sessionId === null || draft.trim() === "") {
       respondJson(response, 400, { error: "sessionId 与 draft 为必填项" });
+      return;
+    }
+    // 草稿长度上限(超限不发起 LLM 调用)
+    const limitError = draftLimitError(draft);
+    if (limitError !== null) {
+      diagLog("enhance-draft-too-long", { sessionId, draftLength: draft.length, limit: MAX_DRAFT_CHARS });
+      respondJson(response, 400, { error: limitError });
       return;
     }
     // Skill 引用提取(与宿主同文法):供 payload 约束与输出兜底校验
