@@ -15,7 +15,8 @@
  *
  * 决策基线(grill 会话共识,详见 CONTEXT.md):
  *   窗口 ~8k token(24000 字符预算)/ 参考文件 top-5 / 摘录 ≤2 篇 × ≤20 行 /
- *   通道 B 超时 90s / 通道 A 超时 60s / 保持输入语言 / 软长度约原文 2 倍。
+ *   通道 B 超时 90s / 通道 A 超时 60s / 保持输入语言(或「转换英文」开关开启时
+ *   统一英文输出)/ 软长度约原文 2 倍。
  *
  * Skill 引用保留(2026-08-22):原始提示词中的 `/skill-name` 记号是宿主技能
  * 引用语法(dsh-tool-skill 以 SKILL_GESTURE 全文扫描用户消息后注入技能全文),
@@ -157,8 +158,9 @@ const { installSettingsSection, settingsNamespace } = dshSettingsMod;
 const Schema = (await loadSchemastery()).default;
 const SETTINGS_NS = settingsNamespace("prompt-enhancer");
 
-/** 设置 schema:model(可选专用模型)+ intensity(强化程度)。
- *  不配置 model = 跟随会话默认模型;intensity 控制输出长度,low 档不带文件引用。
+/** 设置 schema:model(可选专用模型)+ intensity(强化程度)+ outputEnglish(转换英文开关)。
+ *  不配置 model = 跟随会话默认模型;intensity 控制输出长度,low 档不带文件引用;
+ *  outputEnglish 默认关——开启后强化结果无论输入什么语言都输出为英文提示词。
  *  注意:schemastery 的对象字段用 .default(null) 表达可选(实测 .required(false)
  *  在对象字段上不生效,空文档会抛 "model.provider missing required value")。 */
 const SETTINGS_SCHEMA = Schema.object({
@@ -168,15 +170,17 @@ const SETTINGS_SCHEMA = Schema.object({
     reasoningEffort: Schema.string().required(false),
   }).default(null),
   intensity: Schema.union(["low", "medium", "high"]).default("medium"),
+  outputEnglish: Schema.boolean().default(false),
 });
 
 /** 生效配置源:settings 服务挂载后指向其 scope.get(),否则指向入口 base。 */
-let configSource = () => ({ intensity: "medium" });
+let configSource = () => ({ intensity: "medium", outputEnglish: false });
 
 /** 读取当前生效配置(每次请求时调用,保证用户改设置即时生效)。 */
 function enhanceConfig() {
   const value = configSource() ?? {};
   const intensity = value.intensity === "low" || value.intensity === "high" ? value.intensity : "medium";
+  const outputEnglish = value.outputEnglish === true;
   const modelValue = value.model;
   const model =
     modelValue !== null && typeof modelValue === "object" &&
@@ -191,7 +195,7 @@ function enhanceConfig() {
               : undefined,
         }
       : undefined;
-  return { intensity, model };
+  return { intensity, model, outputEnglish };
 }
 
 function diagLog(stage, detail) {
@@ -201,21 +205,35 @@ function diagLog(stage, detail) {
   } catch { /* 诊断日志失败静默 */ }
 }
 
-/** 强化专用 persona:子会话系统段(遮蔽父 persona)与通道 A 的 system 共用。 */
-const ENHANCER_PERSONA = [
-  "你是「提示词增强器」(Prompt Enhancer)。唯一任务:把用户提交的一条原始提示词改写为结构清晰、约束明确、可直接交给 AI 编程 agent 执行的任务提示词,并在末尾附上参考文件清单。",
-  "规则:",
-  "1. 保持用户输入的语言(中文进中文出、英文进英文出),禁止翻译。",
-  "2. 不改变用户真实意图:不得新增用户没要求的功能,不得删除或弱化用户已提出的需求;可对需求做澄清性展开(目标/背景/步骤/约束/验收),并追加最少必要的工作指令(如「先阅读参考文件再动手」)。",
-  "3. 结构建议(按需选用,不要机械套用):目标 / 背景(如有) / 步骤 / 约束 / 验收标准。",
-  "4. 长度软约束:通常不超过原文的 2 倍;不要为凑结构注水。",
-  "5. 仓库知识:若当前工作目录存在,用 glob/grep/read 等只读工具基于原始提示词的关键词,有界地定位 ≤5 个最相关文件(优先 README、docs、架构说明、规则文件,其次直接相关的源码);不要遍历全仓。",
-  "6. 参考文件清单:在输出末尾加「## 参考文件」一节,每行「- 相对路径 — 一句话相关性说明」。只列你实际用 glob/grep/read 打开并确认存在的文件,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);未找到相关文件或没有工作目录时省略该节。",
-  "7. 摘录:最多对 2 个「高相关且短」的文件在清单后附 ≤20 行关键摘录;其余文件只给路径与说明。",
-  "8. 输出格式:只输出改写后的提示词本身(含参考文件节);禁止输出任何解释、前言、确认语或代码围栏。",
-  "9. Skill引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「## 技能引用」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
-  "10. 意图先行:先判断原始提示词的意图类别再组织输出,不机械套用固定模板——排查类(为什么/异常):运行环境与上下文→实际现象→预期行为→需重点核查的方向→要求根本原因与可执行修复步骤;实现类(帮我做/加/改):目标与交付物→技术栈与约束→执行步骤→验收标准;解释/方案类:话题范围与目标读者→需覆盖的维度→依据、例子或对比;简单问答/闲聊:保留原长,只做必要澄清,不过度膨胀。不发明事实:缺关键背景时写成「结合项目代码/日志确认……」由执行者自行核实;一句话含多个问题时拆成编号子问题;原话已完整清晰时只做最小必要改写,不要为改而改。",
-].join("\n");
+/** 强化专用 persona:子会话系统段(遮蔽父 persona)与通道 A 的 system 共用。
+ *  outputEnglish=true(设置「转换英文」开关开启)时切换输出语言规则:
+ *  结果一律英文书写,参考文件节/技能引用节标题随之英文化;skill 记号、路径与
+ *  专有名词仍原样保留(宿主校验与全文扫描依赖原文记号,翻译即失效)。 */
+function enhancerPersona(outputEnglish) {
+  const refsHeading = outputEnglish ? "## Reference Files" : "## 参考文件";
+  const skillHeading = outputEnglish ? "## Skill References" : "## 技能引用";
+  const refsLine = outputEnglish
+    ? "每行「- 相对路径 — a one-line relevance note」(相关性说明用英文)。"
+    : "每行「- 相对路径 — 一句话相关性说明」。";
+  return [
+    "你是「提示词增强器」(Prompt Enhancer)。唯一任务:把用户提交的一条原始提示词改写为结构清晰、约束明确、可直接交给 AI 编程 agent 执行的任务提示词,并在末尾附上参考文件清单。",
+    "规则:",
+    outputEnglish
+      ? "1. 输出语言:无论原始提示词是什么语言,强化结果一律使用英文书写;忠实传达用户真实需求的语义,不得因语言转换新增、删除或弱化需求;代码标识符、文件路径、专有名词与 /skill-name 记号保持原样,不得翻译。"
+      : "1. 保持用户输入的语言(中文进中文出、英文进英文出),禁止翻译。",
+    "2. 不改变用户真实意图:不得新增用户没要求的功能,不得删除或弱化用户已提出的需求;可对需求做澄清性展开(目标/背景/步骤/约束/验收),并追加最少必要的工作指令(如「先阅读参考文件再动手」)。",
+    outputEnglish
+      ? "3. 结构建议(按需选用,不要机械套用,全部用英文书写):Goal / Context (if any) / Steps / Constraints / Acceptance criteria."
+      : "3. 结构建议(按需选用,不要机械套用):目标 / 背景(如有) / 步骤 / 约束 / 验收标准。",
+    "4. 长度软约束:通常不超过原文的 2 倍;不要为凑结构注水。",
+    "5. 仓库知识:若当前工作目录存在,用 glob/grep/read 等只读工具基于原始提示词的关键词,有界地定位 ≤5 个最相关文件(优先 README、docs、架构说明、规则文件,其次直接相关的源码);不要遍历全仓。",
+    "6. 参考文件清单:在输出末尾加「" + refsHeading + "」一节," + refsLine + "只列你实际用 glob/grep/read 打开并确认存在的文件,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);未找到相关文件或没有工作目录时省略该节。",
+    "7. 摘录:最多对 2 个「高相关且短」的文件在清单后附 ≤20 行关键摘录;其余文件只给路径与说明。",
+    "8. 输出格式:只输出改写后的提示词本身(含参考文件节);禁止输出任何解释、前言、确认语或代码围栏。",
+    "9. Skill引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「" + skillHeading + "」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
+    "10. 意图先行:先判断原始提示词的意图类别再组织输出,不机械套用固定模板——排查类(为什么/异常):运行环境与上下文→实际现象→预期行为→需重点核查的方向→要求根本原因与可执行修复步骤;实现类(帮我做/加/改):目标与交付物→技术栈与约束→执行步骤→验收标准;解释/方案类:话题范围与目标读者→需覆盖的维度→依据、例子或对比;简单问答/闲聊:保留原长,只做必要澄清,不过度膨胀。不发明事实:缺关键背景时写成「结合项目代码/日志确认……」由执行者自行核实;一句话含多个问题时拆成编号子问题;原话已完整清晰时只做最小必要改写,不要为改而改。",
+  ].join("\n");
+}
 
 export const name = "@dsh-external/dsh-prompt-enhancer";
 export const inject = ["sessions", "agents", "llm", "webServer", "workspaceRegistry", "sessionQuery"];
@@ -223,7 +241,7 @@ export const inject = ["sessions", "agents", "llm", "webServer", "workspaceRegis
 export function apply(ctx) {
   // 用户设置命名空间(设置 → 插件 → 插件配置 → 提示词强化卡片)
   try {
-    installSettingsSection(ctx, SETTINGS_NS, SETTINGS_SCHEMA, { intensity: "medium" }, {
+    installSettingsSection(ctx, SETTINGS_NS, SETTINGS_SCHEMA, { intensity: "medium", outputEnglish: false }, {
       setSource: (next) => {
         configSource = next;
         diagLog("settings-source-set", { ns: String(SETTINGS_NS) });
@@ -340,10 +358,12 @@ async function handleRoute(ctx, request, response) {
       clientCwd: clientCwd ?? null,
       draftLength: draft.length,
       intensity: cfg.intensity,
+      outputEnglish: cfg.outputEnglish,
       model: cfg.model ?? null,
     });
     const context = boundedContext(source.events);
-    const payload = buildPayload(draft, context, cwd, cfg.intensity, referencedSkills);
+    const payload = buildPayload(draft, context, cwd, cfg.intensity, referencedSkills, cfg.outputEnglish);
+    const persona = enhancerPersona(cfg.outputEnglish);
 
     // 截断标记:两通道输出都可能被 maxTokens 截断;截断时 UI 显式告警
     // (草稿仍替换、还原入口可用)——截断损坏的提示词不得静默覆盖输入框
@@ -351,7 +371,7 @@ async function handleRoute(ctx, request, response) {
     let channel = "child";
     let enhanced;
     try {
-      const result = await enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, aborted.signal, cfg.model);
+      const result = await enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, aborted.signal, cfg.model, persona);
       enhanced = result.text;
       truncated = result.truncated === true;
     } catch (error) {
@@ -366,7 +386,7 @@ async function handleRoute(ctx, request, response) {
       });
       ctx.logger?.warn("[dsh-prompt-enhancer] 通道 B(子会话)失败,降级通道 A(llm 直调): " + String(error));
       channel = "llm";
-      const result = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model);
+      const result = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model, persona);
       enhanced = result.text;
       truncated = result.truncated === true;
     }
@@ -376,9 +396,9 @@ async function handleRoute(ctx, request, response) {
       diagLog("enhance-refs-sanitized", { sessionId, removed: sanitized.removed, cwd: cwd ?? null });
       enhanced = sanitized.text;
     }
-    // Skill 引用兜底:输出丢失记号时确定性回填「## 技能引用」节
+    // Skill 引用兜底:输出丢失记号时确定性回填「## 技能引用」节(英文模式为「## Skill References」)
     if (referencedSkills.length > 0) {
-      const restored = ensureSkillReferences(enhanced, referencedSkills);
+      const restored = ensureSkillReferences(enhanced, referencedSkills, cfg.outputEnglish);
       if (restored.added > 0) {
         diagLog("enhance-skills-restored", { sessionId, requested: restored.requested, added: restored.added, mode: restored.mode });
         enhanced = restored.text;
@@ -606,7 +626,7 @@ function textOfBlocks(blocks) {
     .join("\n");
 }
 
-function buildPayload(draft, context, cwd, intensity, skills = []) {
+function buildPayload(draft, context, cwd, intensity, skills = [], outputEnglish = false) {
   const parts = [];
   if (typeof cwd === "string" && cwd !== "") {
     parts.push("【工作目录】\n" + cwd + "\n(参考文件路径一律使用相对该目录的路径;检索只用 glob/grep/read,不要遍历全仓。)");
@@ -630,12 +650,16 @@ function buildPayload(draft, context, cwd, intensity, skills = []) {
   } else if (intensity === "high") {
     tail += "\n\n【本次强度:高】在不改变用户意图的前提下,允许适度展开背景、步骤与验收细节(通常不超过原文的 3 倍);参考文件节照常输出。";
   }
+  if (outputEnglish === true) {
+    tail += "\n\n【本次输出语言:英文】无论上面的原始提示词是什么语言,强化结果必须全部用英文书写(参考文件节标题固定为「## Reference Files」,集中技能引用节标题为「## Skill References」);skill 引用记号(/xxx)、文件路径与专有名词保持原样,不得翻译。";
+  }
   parts.push(tail);
   return parts.join("\n\n");
 }
 
 /** 中档强度兜底:「## 参考文件」节内每行只保留路径(剥离「— 说明」),删除说明行、摘录与代码块;
- *  整节无有效清单行时删除整节(含标题)。只作用于中档(宿主强制,保证即使模型不听话输出也保持紧凑);低/高档不受影响。 */
+ *  整节无有效清单行时删除整节(含标题)。只作用于中档(宿主强制,保证即使模型不听话输出也保持紧凑);低/高档不受影响。
+ *  标题兼容「## 参考文件」与英文模式「## Reference Files」(两者都必须进入本兜底器,否则英文标题下会漏压缩/漏校验)。 */
 function compactMediumReferences(text) {
   const lines = String(text).split("\n");
   const out = [];
@@ -650,7 +674,7 @@ function compactMediumReferences(text) {
       inFence = !inFence;
       continue; // 节内代码块(摘录)连同围栏删除
     }
-    if (!inRefs && /^##\s*参考文件/i.test(trimmed)) {
+    if (!inRefs && /^##\s*(参考文件|reference\s+files\b)/i.test(trimmed)) {
       inRefs = true;
       refsHeadingIndex = out.length;
       out.push(line);
@@ -685,14 +709,14 @@ function compactMediumReferences(text) {
   return out.join("\n");
 }
 
-/** 低档强度兜底:强制删除「## 参考文件」整节(含摘录),保证输出不带任何文件引用。 */
+/** 低档强度兜底:强制删除参考文件整节(含摘录;标题兼容中文与英文「## Reference Files」),保证输出不带任何文件引用。 */
 function stripReferences(text) {
   const lines = String(text).split("\n");
   const out = [];
   let inRefs = false;
   for (const line of lines) {
     const trimmed = line.trim();
-    if (/^##\s*参考文件/i.test(trimmed)) {
+    if (/^##\s*(参考文件|reference\s+files\b)/i.test(trimmed)) {
       inRefs = true;
       continue;
     }
@@ -718,13 +742,18 @@ function extractSkillNames(text) {
 }
 
 /** 强化输出的 skill 引用兜底:检查增强稿是否仍含全部原始引用记号;
- *  缺失的记号以「## 技能引用」节追加到末尾(宿主对用户消息做全文 gesture
- *  扫描,该节同样命中)。全部保留时不添加任何内容。 */
-function ensureSkillReferences(text, names) {
+ *  缺失的记号以技能引用节追加到末尾(标题:中文模式「## 技能引用」、英文模式
+ *  「## Skill References」;宿主对用户消息做全文 gesture 扫描,该节同样命中)。
+ *  全部保留时不添加任何内容。 */
+function ensureSkillReferences(text, names, outputEnglish = false) {
   const kept = extractSkillNames(text);
   const missing = names.filter((name) => !kept.includes(name));
   if (missing.length === 0) return { text, added: 0, requested: names.length, mode: "none" };
-  const section = "\n\n## 技能引用\n以下记号是宿主平台的技能(skills)调用标记,发送后会由宿主注入对应技能的完整说明,不得删除、改写或翻译:\n"
+  const heading = outputEnglish ? "## Skill References" : "## 技能引用";
+  const intro = outputEnglish
+    ? "The following tokens are host-platform skill invocation markers; the host injects the full skill instructions after sending. Do not delete, rewrite or translate them:\n"
+    : "以下记号是宿主平台的技能(skills)调用标记,发送后会由宿主注入对应技能的完整说明,不得删除、改写或翻译:\n";
+  const section = "\n\n" + heading + "\n" + intro
     + missing.map((name) => "- /" + name).join("\n")
     + "\n";
   return {
@@ -736,7 +765,7 @@ function ensureSkillReferences(text, names) {
 }
 
 /* ═══════════════ 参考清单校验(防臆造路径) ═══════════════ */
-/** 校验「## 参考文件」节:相对 cwd 解析后不存在的路径行剔除;节内路径全无效则整节删除。
+/** 校验参考文件节(标题兼容「## 参考文件」与英文模式「## Reference Files」):相对 cwd 解析后不存在的路径行剔除;节内路径全无效则整节删除。
  *  只校验列表行(以 - / * 开头且能提取出路径的),说明行/摘录块原样保留。 */
 function sanitizeReferences(text, cwd) {
   if (typeof cwd !== "string" || cwd === "") return { text, removed: 0 };
@@ -755,7 +784,7 @@ function sanitizeReferences(text, cwd) {
       out.push(line);
       continue;
     }
-    if (/^##\s*参考文件/i.test(trimmed)) {
+    if (/^##\s*(参考文件|reference\s+files\b)/i.test(trimmed)) {
       inRefs = true;
       refsHeadingIndex = out.length;
       out.push(line);
@@ -804,7 +833,7 @@ function sanitizeReferences(text, cwd) {
  * 只读限制);false:裸子会话(只注入 persona,不 join 任何预设——预设层的首轮机制
  * 不会作用于它,退化为纯改写)。fatal 错误(超时/客户端取消)以 error.fatal 标记,
  * 调用方不应重试;无文本/回合错误可重试。 */
-async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, joinPreset) {
+async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, joinPreset, persona) {
   // 配置了专用模型:agentOptions 覆盖 provider/model;effort 经 agent/request waterfall 注入
   // (agent-loop 的 buildRequest 只从会话 header 继承 effort,子会话 header 无此配置)。
   const effectiveProvider = modelCfg?.provider ?? route.provider;
@@ -838,9 +867,10 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
         ctx.logger?.warn("[dsh-prompt-enhancer] composeFrom 失败(子会话无工具): " + String(error));
       }
     }
-    // 强化专用 persona 遮蔽父 persona(同名同序段)
+    // 强化专用 persona 遮蔽父 persona(同名同序段);persona 由调用方按
+    // 「转换英文」开关生成(英文输出时语言规则与节标题随之切换)
     try {
-      childCtx.systemPrompt?.section?.({ name: "deployment:persona", order: 0, text: ENHANCER_PERSONA });
+      childCtx.systemPrompt?.section?.({ name: "deployment:persona", order: 0, text: persona });
     } catch (error) {
       ctx.logger?.warn("[dsh-prompt-enhancer] systemPrompt.section 失败: " + String(error));
     }
@@ -943,11 +973,11 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
  * 而只读限制已将其移除——子会话首轮直接 turn 错误、无文本)时,退化为不 join
  * 预设的裸子会话重试一次(纯改写、无文件检索——ADR-0001「无工具时 B 退化为纯
  * 改写」语义)。致命错误(超时/客户端取消, error.fatal)不重试。 */
-async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal, modelCfg) {
+async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal, modelCfg, persona) {
   const parent = ctx.agents.get(sessionId);
   if (parent !== undefined) {
     try {
-      return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, true);
+      return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, true, persona);
     } catch (error) {
       if (error?.fatal === true || signal?.aborted === true) throw error;
       // 预设组合无文本(如 router-bootstrap: no platform shell in catalog)或
@@ -956,7 +986,7 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
       diagLog("enhance-child-retry-bare", { sessionId, reason: String(error?.message ?? error) });
     }
   }
-  return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, parent === undefined);
+  return await runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, parent === undefined, persona);
 }
 
 /** 等待子代理回合结束:超时(90s)与客户端取消(signal)都会 cancel 子代理。 */
@@ -1044,7 +1074,7 @@ function cleanAssistantText(text) {
 
 /* ═══════════════ 通道 A:llm 直调降级 ═══════════════ */
 
-async function enhanceWithLlm(ctx, route, payload, signal, modelCfg) {
+async function enhanceWithLlm(ctx, route, payload, signal, modelCfg, persona) {
   let text = "";
   let truncated = false;
   const provider = modelCfg?.provider ?? route.provider;
@@ -1055,7 +1085,7 @@ async function enhanceWithLlm(ctx, route, payload, signal, modelCfg) {
   const stream = ctx.llm.stream({
     provider,
     model,
-    system: ENHANCER_PERSONA,
+    system: persona,
     messages: [userMessage(payload)],
     temperature: 0.2,
     ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
