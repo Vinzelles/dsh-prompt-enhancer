@@ -92,6 +92,14 @@ window.__ModuleLoader__.load({
       ".dpe_radio small{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:14px}",
       ".dpe_radio[data-on=true]{border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 10%,transparent)}",
       ".dpe_radio:disabled{opacity:.5;cursor:not-allowed}",
+      // 转换英文开关(设置卡片内):iOS 风格小开关
+      ".dpe_toggleRow{display:flex;align-items:center;justify-content:space-between;gap:12px}",
+      ".dpe_switch{box-sizing:border-box;position:relative;flex:none;width:36px;height:20px;cursor:pointer;background:var(--dsw-alias-border-l2);border:0;border-radius:10px;transition:background .15s ease;padding:0}",
+      ".dpe_switch[data-on=true]{background:var(--dsw-alias-state-business-primary)}",
+      ".dpe_switch::after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:transform .15s ease}",
+      ".dpe_switch[data-on=true]::after{transform:translateX(16px)}",
+      ".dpe_switch:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}",
+      ".dpe_switch:disabled{opacity:.5;cursor:not-allowed}",
       ".dpe_cardFoot{display:flex;align-items:center;gap:8px;padding-top:2px}",
       ".dpe_save{box-sizing:border-box;border:0;color:#fff;background:var(--dsw-alias-state-business-primary);cursor:pointer;border-radius:8px;height:30px;padding:0 16px;font-size:13px;line-height:18px}",
       ".dpe_save:disabled{opacity:.5;cursor:default}",
@@ -344,6 +352,11 @@ window.__ModuleLoader__.load({
           state.staged = { ...state.staged, intensity: value };
         });
       };
+      const editOutputEnglish = (value) => {
+        store.update((state) => {
+          state.staged = { ...state.staged, outputEnglish: Boolean(value) };
+        });
+      };
       const save = async () => {
         const snapshot = store.getSnapshot();
         if (snapshot.saving || !snapshot.writable) return;
@@ -381,6 +394,14 @@ window.__ModuleLoader__.load({
             landed = false;
           }
         }
+        if (Object.hasOwn(staged, "outputEnglish") && staged.outputEnglish !== (snapshot.value.outputEnglish === true)) {
+          try {
+            await scope.set("outputEnglish", staged.outputEnglish);
+            landed = landed && (scope.getSnapshot().user?.outputEnglish === true) === staged.outputEnglish;
+          } catch {
+            landed = false;
+          }
+        }
         store.update((state) => {
           state.saving = false;
           state.failed = !landed;
@@ -399,6 +420,7 @@ window.__ModuleLoader__.load({
           hooks: { promptEnhancerSettings: store },
           editModel,
           editIntensity,
+          editOutputEnglish,
           save,
           discard,
           loadModels,
@@ -406,9 +428,9 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** 设置卡片组件:模型三级联动(provider→model→effort)+ 强度三档。
-     *  face 注入的 editModel/editIntensity/save/discard/loadModels 以顶层 props 到达。 */
-    function SettingsCard({ usePromptEnhancerSettings, t, editModel, editIntensity, save, discard, loadModels }) {
+    /** 设置卡片组件:模型三级联动(provider→model→effort)+ 强度三档 + 转换英文开关。
+     *  face 注入的 editModel/editIntensity/editOutputEnglish/save/discard/loadModels 以顶层 props 到达。 */
+    function SettingsCard({ usePromptEnhancerSettings, t, editModel, editIntensity, editOutputEnglish, save, discard, loadModels }) {
       const state = usePromptEnhancerSettings((snapshot) => snapshot);
 
       // 打开设置页即拉取模型目录
@@ -419,6 +441,7 @@ window.__ModuleLoader__.load({
 
       const stagedModel = Object.hasOwn(state.staged, "model") ? state.staged.model : (state.value.model ?? null);
       const stagedIntensity = Object.hasOwn(state.staged, "intensity") ? state.staged.intensity : (state.value.intensity ?? "medium");
+      const stagedOutputEnglish = Object.hasOwn(state.staged, "outputEnglish") ? state.staged.outputEnglish === true : state.value.outputEnglish === true;
       const selectedProvider = stagedModel?.provider ?? "";
       const providerGroup = state.modelsGroups.find((group) => group.id === selectedProvider) ?? null;
       const selectedModelId = stagedModel?.model ?? "";
@@ -457,7 +480,8 @@ window.__ModuleLoader__.load({
             stagedModel.model !== state.value.model.model ||
             (stagedModel.reasoningEffort ?? "") !== (state.value.model.reasoningEffort ?? ""));
       const intensityDirty = Object.hasOwn(state.staged, "intensity") && stagedIntensity !== state.value.intensity;
-      const dirty = modelDirty || intensityDirty;
+      const outputEnglishDirty = Object.hasOwn(state.staged, "outputEnglish") && stagedOutputEnglish !== (state.value.outputEnglish === true);
+      const dirty = modelDirty || intensityDirty || outputEnglishDirty;
 
       const modelField = jsx("div", {
         className: "dpe_field",
@@ -530,6 +554,29 @@ window.__ModuleLoader__.load({
         ],
       });
 
+      const outputEnglishField = jsx("div", {
+        className: "dpe_field",
+        children: [
+          jsx("div", {
+            className: "dpe_toggleRow",
+            children: [
+              jsx("span", { className: "dpe_fieldLabel", children: t("outputEnglishLabel") }),
+              jsx("button", {
+                type: "button",
+                role: "switch",
+                "aria-checked": stagedOutputEnglish,
+                "aria-label": t("outputEnglishLabel"),
+                className: "dpe_switch",
+                "data-on": stagedOutputEnglish ? "true" : undefined,
+                disabled: readonly,
+                onClick: () => editOutputEnglish(!stagedOutputEnglish),
+              }),
+            ],
+          }),
+          jsx("span", { className: "dpe_cardHint", children: t("outputEnglishHint") }),
+        ],
+      });
+
       return jsx("div", {
         className: "dpe_card",
         "data-prompt-enhancer-settings": "",
@@ -543,6 +590,7 @@ window.__ModuleLoader__.load({
           }),
           modelField,
           intensityField,
+          outputEnglishField,
           state.failed ? jsx("span", { className: "dpe_cardError", children: t("saveFailed") }) : null,
           jsx("div", {
             className: "dpe_cardFoot",
@@ -585,7 +633,7 @@ window.__ModuleLoader__.load({
       enhancing: "正在强化提示词…",
       cancel: "取消",
       settingsTitle: "提示词强化",
-      settingsDescription: "配置「强化」使用的模型与输出强度。",
+      settingsDescription: "配置「强化」使用的模型、输出强度与输出语言。",
       modelLabel: "强化模型",
       modelFollowSession: "跟随会话默认（推荐）",
       modelProvider: "提供方",
@@ -599,6 +647,8 @@ window.__ModuleLoader__.load({
       intensityMediumHint: "标准优化，参考文件仅列路径",
       intensityHigh: "高",
       intensityHighHint: "充分展开，可附参考文件",
+      outputEnglishLabel: "转换英文",
+      outputEnglishHint: "开启后，强化结果将自动输出为英文提示词（参考文件节标题为「## Reference Files」）。",
       save: "保存",
       saving: "保存中…",
       discard: "放弃修改",
@@ -617,7 +667,7 @@ window.__ModuleLoader__.load({
       enhancing: "Enhancing prompt…",
       cancel: "Cancel",
       settingsTitle: "Prompt Enhancer",
-      settingsDescription: "Configure the model and output intensity used by Enhance.",
+      settingsDescription: "Configure the model, output intensity, and output language used by Enhance.",
       modelLabel: "Enhancement model",
       modelFollowSession: "Follow session default (recommended)",
       modelProvider: "Provider",
@@ -631,6 +681,8 @@ window.__ModuleLoader__.load({
       intensityMediumHint: "Standard rewrite, path-only references",
       intensityHigh: "High",
       intensityHighHint: "Full expansion, may include references",
+      outputEnglishLabel: "Translate to English",
+      outputEnglishHint: "When on, the enhanced prompt is always output in English (reference section heading becomes “## Reference Files”).",
       save: "Save",
       saving: "Saving…",
       discard: "Discard",
