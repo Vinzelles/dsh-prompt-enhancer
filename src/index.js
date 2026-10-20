@@ -47,19 +47,26 @@ function draftLimitError(draft) {
   return draft.length > MAX_DRAFT_CHARS ? "草稿超过长度上限(" + MAX_DRAFT_CHARS + " 字符)" : null;
 }
 
-import { appendFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { Config, CONFIG_KEYS, readEnhancerConfig } from "./config.js";
+
+/** 设置面板的官方入口(dsh 0.2.x):由 config.js 导出的 schemastery Config 决定。
+ *  宿主 SettingsForms.describe() 直接读 `entry.fiber.runtime.Config`,没有注册 API。 */
+export { Config, CONFIG_KEYS };
+
 const DIAG_FILE = join(process.env.DSH_HOME || join(homedir(), ".dsh"), "super-injector", "prompt-enhancer-diag.log");
 
 /* ═══════════════ 第三方依赖加载 ═══════════════
- * 本插件在 profile node_modules 里是 junction 指向源码目录,源码目录没有 node_modules;
- * cordis loader 的静态裸 specifier 解析会从 realpath 后的位置向上找,必然失败
- * (Node 内部报 "job must be an instance of ModuleJob")。因此这里不写静态 import,
- * 而是运行时 await import() 绝对 file URL:dsh-settings/schemastery 物理位于
- * 宿主依赖树内,其自身依赖从它们所在目录的 node_modules 树解析,天然成功。 */
+ * 0.2.x 起设置面板走官方 Config 通道(见 config.js),插件不再需要自己 import
+ * schemastery 造 schema;下面这段只服务 subagent/descriptor 契约版本探测
+ * (要读宿主 dsh-subagent 的真实常量)。
+ * 本插件部署在 vendor 目录(无 node_modules),所以用「定位包目录 + 绝对 file URL
+ * 运行时 import」而不是静态裸 import:dsh-subagent 物理位于宿主依赖树内,
+ * 其自身依赖从它所在目录的 node_modules 树解析,天然成功。 */
 
 /** 探测宿主依赖树中 @deepseek-ai 包的实际目录(2026-08-20 消失事件后重构:
  *  profile pnpm 重装后顶层 node_modules 不再挂传递依赖——dsh-settings 退化为
@@ -97,16 +104,38 @@ function findPackageDir(pkg) {
     dir = up;
   }
   // ④ 基于本模块位置的向上探测(junction realpath 后到源码目录,源码树内无依赖时兜底)
+  //    以及「托管包自带依赖图」优先位:部署到 node_modules 下的副本会带精确依赖。
   const here = dirname(fileURLToPath(import.meta.url));
+  add(resolve(here, "..", "node_modules"));
   for (let dir = here; ; ) {
     add(join(dir, "node_modules"));
     const up = dirname(dir);
     if (up === dir) break;
     dir = up;
   }
-  // ⑤ Windows desktop 官方依赖树(宿主自该树启动时 @deepseek-ai/* 的物理位置)
+  // ⑤ 宿主进程自身的安装位置(最可靠的运行时事实):宿主 bin 在
+  //    <install>/dependencies/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js,
+  //    从 argv[1] 逐级向上即可覆盖任何发行版目录命名。
+  const argvEntry = process.argv?.[1];
+  if (typeof argvEntry === "string" && argvEntry !== "") {
+    for (let dir = dirname(argvEntry); ; ) {
+      add(join(dir, "node_modules"));
+      const up = dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  }
+  // ⑥ Windows desktop 官方依赖树:desktop 外壳的 app-dir 名随发行版变化
+  //    (dsh-tauri / io.github.hairyf.deepseek-harness-desktop / ...),因此遍历
+  //    AppData\Roaming 下带 dependencies\dsh\node_modules 的目录,不硬编码名字。
   if (process.platform === "win32") {
-    add(join(homedir(), "AppData", "Roaming", "io.github.hairyf.deepseek-harness-desktop", "dependencies", "dsh", "node_modules"));
+    const roaming = join(homedir(), "AppData", "Roaming");
+    try {
+      for (const entry of readdirSync(roaming)) {
+        add(join(roaming, entry, "dependencies", "dsh", "node_modules"));
+      }
+    } catch { /* AppData 不可读:跳过 */ }
+    add(join(roaming, "io.github.hairyf.deepseek-harness-desktop", "dependencies", "dsh", "node_modules"));
   }
   const enc = pkg.replace("/", "+");
   for (const nm of roots) {
@@ -130,55 +159,124 @@ function findPackageDir(pkg) {
   return undefined;
 }
 
-const SETTINGS_PKG_DIR = findPackageDir("@deepseek-ai/dsh-settings");
-const SCHEMA_PKG_DIR = findPackageDir("@deepseek-ai/schemastery");
+const SUBAGENT_PKG_DIR = findPackageDir("@deepseek-ai/dsh-subagent");
 
-/** 运行时加载 @deepseek-ai/dsh-settings(installSettingsSection / settingsNamespace)。 */
-async function loadDshSettings() {
-  const entry = join(SETTINGS_PKG_DIR, "lib", "index.js");
-  return await import(pathToFileURL(entry).href);
+/* ═══════════════ subagent/descriptor 版本契约(宿主联动,兼容 0.1.1 过渡期) ═══════════════
+ * 宿主 0.1.2 起 SUBAGENT_DESCRIPTOR_VERSION 从 2 升到 3(0.1.0-rc.8~0.1.1-rc.2 = 2;
+ * 0.1.2-alpha.2 起 = 3,均经 npm 发布物实证),且 dsh-subagent 的 foldSubagentDescriptor
+ * 对「版本不等于当前值」的 payload 一律返回 undefined → 子会话身份投影折叠为 null →
+ * 子代理目录(list-children)把该子会话判为 diagnostic/corrupt → UI 显示「会话记录损坏」。
+ * 硬编码任何版本号都会让另一代宿主踩坑(写 3 则 0.1.1 损坏,写 2 则 0.1.2 损坏),
+ * 因此模块加载时按三级通道解析宿主真实契约:
+ *   ① import 宿主 dsh-subagent 的 lib/types/descriptor.js 读 SUBAGENT_DESCRIPTOR_VERSION
+ *      (与宿主同一份运行时事实,profile 树里残留的旧版 dsh-subagent 不会误导);
+ *   ② 裸 import 失败(如宿主包自身依赖解析异常)→ 读同一文件正则扫描常量;
+ *   ③ 常量不可见(如宿主改版挪走文件/常量名)→ 按 dsh-subagent 包 semver 推断:
+ *      < 0.1.2 → 2,≥ 0.1.2 → 3(即上方实证边界 descriptorVersionFromPackageJson)。
+ * 三级全失败(宿主包整体定位不到——此时无子代理目录折叠,descriptor 版本无真实消费方)
+ * 才用最终兜底 3(最新契约),并落盘信标。one-shot 字段集(version/mode/provider/label)
+ * 在 v2/v3 逐字相同(2026-09-07 比对 0.1.1-rc.2 与 0.1.2-rc.1 的 DESCRIPTOR_BASE_KEYS),
+ * 故只需随解析版本 stamp 数字;若未来宿主改版新增必填字段,需要插件同步调整 payload 形态。
+ * 0.1.1 兼容为过渡支持(README「宿主兼容」),后续版本将逐渐弃用。 */
+function scanDescriptorVersionFromFile(pkgDir) {
+  try {
+    const text = readFileSync(join(pkgDir, "lib", "types", "descriptor.js"), "utf8");
+    const match = /SUBAGENT_DESCRIPTOR_VERSION\s*=\s*(\d+)/.exec(text);
+    const v = match === null ? NaN : Number(match[1]);
+    return Number.isInteger(v) && v > 0 ? v : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
-/** 运行时加载 @deepseek-ai/schemastery(Schema 对象)。 */
-async function loadSchemastery() {
-  const entry = join(SCHEMA_PKG_DIR, "lib", "index.mjs");
-  return await import(pathToFileURL(entry).href);
+/** 通道③:按宿主 dsh-subagent 包自身 semver 推断契约版本(实证边界 0.1.2)。
+ *  0.x 且 (minor < 1 || (minor === 1 && patch < 2)) → 2;其余(0.1.2+/0.2+/1+) → 3。
+ *  版本号不可解析 → undefined(交给调用方最终兜底)。 */
+function descriptorVersionFromPackageJson(pkgDir) {
+  try {
+    const raw = JSON.parse(readFileSync(join(pkgDir, "package.json"), "utf8"));
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(raw?.version ?? ""));
+    if (match === null) return undefined;
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    const patch = Number(match[3]);
+    if (major > 0) return 3;
+    if (minor > 1 || (minor === 1 && patch >= 2)) return 3;
+    return 2;
+  } catch {
+    return undefined;
+  }
 }
 
-/* ═══════════════ 用户设置(schema + 生效值源) ═══════════════ */
-
-if (SETTINGS_PKG_DIR === undefined || SCHEMA_PKG_DIR === undefined) {
-  const msg = `[dsh-prompt-enhancer] 未能定位 @deepseek-ai 依赖(dsh-settings=${SETTINGS_PKG_DIR ?? "未找到"}, schemastery=${SCHEMA_PKG_DIR ?? "未找到"}),设置卡片不可用——依赖应位于 profile node_modules(顶层或 .pnpm 虚拟存储)或 desktop 官方依赖树内`;
-  try { diagLog("deps-resolution-failed", { dshSettings: SETTINGS_PKG_DIR ?? null, schemastery: SCHEMA_PKG_DIR ?? null }); } catch {}
-  throw new Error(msg);
+/** 三级解析宿主 descriptor 契约版本;importModule 注入以便单测。
+ *  返回 { version, channel } 或 undefined(全通道失败)。 */
+async function resolveDescriptorVersion(pkgDir, importModule) {
+  try {
+    const descriptorEntry = pathToFileURL(join(pkgDir, "lib", "types", "descriptor.js")).href;
+    const mod = await importModule(descriptorEntry);
+    const v = mod?.SUBAGENT_DESCRIPTOR_VERSION;
+    if (Number.isInteger(v) && v > 0) return { version: v, channel: "import" };
+  } catch { /* 通道② 继续 */ }
+  const scanned = scanDescriptorVersionFromFile(pkgDir);
+  if (scanned !== undefined) return { version: scanned, channel: "scan" };
+  const inferred = descriptorVersionFromPackageJson(pkgDir);
+  if (inferred !== undefined) return { version: inferred, channel: "package-version" };
+  return undefined;
 }
-try { diagLog("deps-resolved", { dshSettings: SETTINGS_PKG_DIR, schemastery: SCHEMA_PKG_DIR }); } catch {}
-const dshSettingsMod = await loadDshSettings();
-const { installSettingsSection, settingsNamespace } = dshSettingsMod;
-const Schema = (await loadSchemastery()).default;
-const SETTINGS_NS = settingsNamespace("prompt-enhancer");
 
-/** 设置 schema:model(可选专用模型)+ intensity(强化程度)+ outputEnglish(转换英文开关)。
- *  不配置 model = 跟随会话默认模型;intensity 控制输出长度,low 档不带文件引用;
- *  outputEnglish 默认关——开启后强化结果无论输入什么语言都输出为英文提示词。
- *  注意:schemastery 的对象字段用 .default(null) 表达可选(实测 .required(false)
- *  在对象字段上不生效,空文档会抛 "model.provider missing required value")。 */
-const SETTINGS_SCHEMA = Schema.object({
-  model: Schema.object({
-    provider: Schema.string().required(),
-    model: Schema.string().required(),
-    reasoningEffort: Schema.string().required(false),
-  }).default(null),
-  intensity: Schema.union(["low", "medium", "high"]).default("medium"),
-  outputEnglish: Schema.boolean().default(false),
-});
+let descriptorVersion;
+let descriptorVersionChannel = "pin-latest";
+try {
+  const subagentPkgDir = SUBAGENT_PKG_DIR;
+  if (subagentPkgDir !== undefined) {
+    const resolved = await resolveDescriptorVersion(subagentPkgDir, (url) => import(url));
+    if (resolved !== undefined) {
+      descriptorVersion = resolved.version;
+      descriptorVersionChannel = resolved.channel;
+    }
+  }
+} catch (error) {
+  try { diagLog("descriptor-version-resolve-error", { message: String(error?.message ?? error) }); } catch {}
+}
+if (descriptorVersion === undefined) descriptorVersion = 3;
+try {
+  if (descriptorVersionChannel === "pin-latest") {
+    // 三级通道全失败才 pin:将来宿主换常量时会静默变 corrupt,必须留痕(与 ADR-0004 残留风险对应)
+    console.warn("[dsh-prompt-enhancer] 未能解析宿主 subagent/descriptor 契约版本,已 pin 3——若该宿主常量不同,强化子会话会被判「会话记录损坏」");
+  }
+  diagLog("descriptor-version-resolved", { version: descriptorVersion, channel: descriptorVersionChannel });
+} catch {}
 
-/** 生效配置源:settings 服务挂载后指向其 scope.get(),否则指向入口 base。 */
-let configSource = () => ({ intensity: "medium", outputEnglish: false });
+/* ═══════════════ 用户设置(生效值源) ═══════════════
+ * dsh 0.2.x 的 settings seam 只有一条官方通道(0.1.x 的三种注册 API 已全部移除,
+ * 全宿主 grep installSection 零命中):
+ *   插件的 `export const Config`(schemastery schema,见 config.js)
+ *   → 宿主 SettingsForms.describe() 读 entry.fiber.runtime.Config 投影成表单
+ *   → 客户端 ctx.configForms.get(entryId) 渲染卡片并 set/unset 字段
+ *   → cordis 把新值写进 volatile 引用,不重启插件 → 本插件每次请求 ref.get() 即时生效。
+ * 因此这里不再注册任何 schema:hooks 形态的 installSection 已经不存在了。 */
 
-/** 读取当前生效配置(每次请求时调用,保证用户改设置即时生效)。 */
-function enhanceConfig() {
-  const value = configSource() ?? {};
+const SETTINGS_NS = "prompt-enhancer";
+const SETTINGS_DEFAULTS = { intensity: "medium", outputEnglish: false };
+
+/** 每个插件实例(apply 的 ctx)自己的配置源。
+ *  volatile 字段必须每次重新读 ref,用户改设置才会即时生效;用 WeakMap 而不是
+ *  模块级变量,避免同一进程内多 profile/多次 apply 时互相串味。 */
+const profileConfigSources = new WeakMap();
+
+/** 读取当前生效配置(每次请求时调用,保证用户改设置即时生效)。
+ *  config 缺失(旧宿主 / 未声明 Config)时退回 SETTINGS_DEFAULTS。 */
+function enhanceConfig(ctx) {
+  const source = profileConfigSources.get(ctx);
+  let value = SETTINGS_DEFAULTS;
+  if (typeof source === "function") {
+    try {
+      value = source() ?? SETTINGS_DEFAULTS;
+    } catch (error) {
+      diagLog("config-read-error", { message: String(error?.message ?? error) });
+      value = SETTINGS_DEFAULTS;
+    }
+  }
   const intensity = value.intensity === "low" || value.intensity === "high" ? value.intensity : "medium";
   const outputEnglish = value.outputEnglish === true;
   const modelValue = value.model;
@@ -238,23 +336,23 @@ function enhancerPersona(outputEnglish) {
 export const name = "@dsh-external/dsh-prompt-enhancer";
 export const inject = ["sessions", "agents", "llm", "webServer", "workspaceRegistry", "sessionQuery"];
 
-export function apply(ctx) {
-  // 用户设置命名空间(设置 → 插件 → 插件配置 → 提示词强化卡片)
+/** 装配本实例的配置源(0.2.x:apply 第二参 = cordis 用 Config 校验后的配置)。
+ *  volatile 字段是引用对象,必须每次 get() 才能拿到用户当前值;引用对象本身不变,
+ *  所以这里只需闭包持有 config,不必订阅任何事件。
+ *  旧宿主(无 Config 通道)保持 SETTINGS_DEFAULTS。 */
+function bindConfigSource(ctx, config) {
+  if (config === null || typeof config !== "object") return;
+  const first = CONFIG_KEYS.some((key) => Reflect.get(config, key) !== undefined);
+  if (!first) return;
+  profileConfigSources.set(ctx, () => readEnhancerConfig(config));
   try {
-    installSettingsSection(ctx, SETTINGS_NS, SETTINGS_SCHEMA, { intensity: "medium", outputEnglish: false }, {
-      setSource: (next) => {
-        configSource = next;
-        diagLog("settings-source-set", { ns: String(SETTINGS_NS) });
-      },
-      onChange: () => {
-        diagLog("settings-change", { ns: String(SETTINGS_NS) });
-      },
-    });
-    diagLog("settings-installed", { ns: String(SETTINGS_NS) });
-  } catch (error) {
-    diagLog("settings-install-error", { message: String(error?.message ?? error) });
-    ctx.logger?.warn("[dsh-prompt-enhancer] settings 注册失败(设置卡片不可用): " + String(error));
-  }
+    diagLog("config-bound", { ns: SETTINGS_NS, keys: Object.keys(config) });
+  } catch {}
+}
+
+export function apply(ctx, config) {
+  // 0.2.x 官方配置通道:本实例的生效值源(用户改设置即时生效,无需重启插件)
+  bindConfigSource(ctx, config);
   ctx.effect(() => ctx.webServer.register({
     kind: "exact",
     path: ENDPOINT,
@@ -350,7 +448,7 @@ async function handleRoute(ctx, request, response) {
     const route = await routeOf(ctx, sessionId, source.events);
     const resolved = cwdOf(ctx, sessionId, source.events, clientCwd);
     const cwd = resolved.cwd;
-    const cfg = enhanceConfig();
+    const cfg = enhanceConfig(ctx);
     diagLog("enhance-start", {
       sessionId,
       cwd: cwd ?? null,
@@ -827,6 +925,73 @@ function sanitizeReferences(text, cwd) {
   return { text: out.join("\n"), removed };
 }
 
+/* ═══════════════ 子代理身份追加(descriptor) ═══════════════
+ *
+ * 契约:任何 header.origin="subagent" 的会话,其自身事件后缀里必须恰有一条
+ * subagent/descriptor;否则 dsh-subagent 的身份投影(projection key "subagent")
+ * 折叠为 null → 冷读路径(list-children 的 resolveColdIdentity)拿不到 identity →
+ * 返回 {kind:"diagnostic", reason:"corrupt"} → UI 显示「会话记录损坏」。
+ * 两条前置条件,缺一即 corrupt:① payload 的 version 等于宿主当前
+ * SUBAGENT_DESCRIPTOR_VERSION(见上文三级解析);② 事件真的进了日志。
+ *
+ * 追加的落点必须是 **Agent 实例**,不是 ctx:setup 的第二参是 agent(官方驱动
+ * dsh-subagent-in-process-driver 即用 `appendDelegatedPolicyOverrides(child.session)`),
+ * 事件面 agent/pre-step 的载荷里也带 agent。**不存在 childCtx.agent** —— ctx 上注册的
+ * 服务名是 `agents`(AgentRegistry 注册表),所以 `childCtx.agent.session` 抛
+ * TypeError;旧实现把它包在 try/catch 里只 warn,于是每次强化都静默少写一条
+ * descriptor,子会话必然被判 corrupt(2026-09-12 实证:真实子会话日志里只有
+ * session/end-seed、permission/preset…,foldSubagentDescriptor([]) === undefined)。
+ *
+ * 双通道,appended 标志保证恰好一条:
+ *   ① setup 窗口立即追加(第二参可用时)——连未被 step 就取消的子会话也带身份;
+ *   ② 退化到与官方驱动同形的首步 agent/pre-step 追加(宿主若不再传第二参)。
+ * 两个落点都不可用时落盘醒目的诊断(armed=false):这等价于该子会话注定 corrupt,
+ * 必须能在 prompt-enhancer-diag.log 里查到,而不是只在宿主 logger 里一闪而过。 */
+function installDescriptorAppend(childCtx, child, payload) {
+  let appended = false;
+  let armed = false;
+  let path = null;
+  const append = (agent) => {
+    if (appended) return false;
+    const session = agent?.session;
+    if (session === undefined || typeof session.append !== "function") return false;
+    session.append("subagent/descriptor", payload);
+    appended = true;
+    return true;
+  };
+  if (append(child)) {
+    armed = true;
+    path = "setup-arg";
+  } else {
+    try {
+      childCtx.on("agent/pre-step", async ({ agent }, next) => {
+        const decision = await next();
+        if (!appended && decision?.kind === "enter" && append(agent)) path = "pre-step";
+        return decision;
+      });
+      armed = true;
+    } catch { /* 事件面不可用:只剩 setup 窗口那一次机会 */ }
+  }
+  return { appended: () => appended, armed: () => armed, path: () => path };
+}
+
+/** 子代理身份(descriptor)安装器:见上文「子代理身份追加」契约说明。 */
+
+/** 读一次会话事件(跨宿主代际兼容入口)。
+ *  dsh-session 的 Session 事件面在代际之间改过名:0.1.2-alpha.1 及更早只有
+ *  getter `events`(无 snapshotEvents),0.1.2-rc.1 两者都有,0.1.5-rc.2 的类表面
+ *  只剩 `snapshotEvents()`。插件横跨这些代际,所以两个入口都试(先文档化的
+ *  snapshotEvents(),再旧 getter),都没有才返回空数组——绝不让一次宿主改版把
+ *  「读事件」变成 TypeError 而中断整条强化(与 descriptor 落点同类的事故形态)。 */
+function sessionEvents(session) {
+  if (session === undefined || session === null) return [];
+  if (typeof session.snapshotEvents === "function") {
+    const events = session.snapshotEvents();
+    if (Array.isArray(events)) return events;
+  }
+  return Array.isArray(session.events) ? session.events : [];
+}
+
 /* ═══════════════ 通道 B:隔离子会话 agent ═══════════════ */
 
 /** 跑一次强化子会话。joinPreset=true:继承父会话预设组合(composeFrom + persona +
@@ -839,22 +1004,15 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
   const effectiveProvider = modelCfg?.provider ?? route.provider;
   const effectiveModel = modelCfg?.model ?? route.model;
   const childId = "session-" + globalThis.crypto.randomUUID();
-  const setup = (childCtx) => {
-    // 子代理目录身份契约:任何 origin="subagent" 的会话都必须有一条
-    // subagent/descriptor 事件,否则 dsh-subagent 的 catalog 无法折叠出子代理身份,
-    // 会把该会话判为 corrupt(界面显示「会话记录损坏」)。官方驱动
-    // (dsh-subagent-in-process-driver)在首步 pre-step 追加;本插件在创建窗口内
-    // 直接补写 one-shot descriptor,保证即使子会话被取消/无文本也带上身份。
-    try {
-      childCtx.agent.session.append("subagent/descriptor", {
-        version: 2,
-        mode: "one-shot",
-        provider: "prompt-enhancer",
-        label: "提示词强化",
-      });
-    } catch (error) {
-      ctx.logger?.warn("[dsh-prompt-enhancer] subagent/descriptor 追加失败: " + String(error));
-    }
+  let descriptorInstall;
+  const setup = (childCtx, child) => {
+    // 子代理身份(version + 落点两条契约见 installDescriptorAppend 说明)。
+    descriptorInstall = installDescriptorAppend(childCtx, child, {
+      version: descriptorVersion,
+      mode: "one-shot",
+      provider: "prompt-enhancer",
+      label: "提示词强化",
+    });
     // 继承父会话工具组合(与 dsh-subagent applyChildComposition 同法);
     // 裸子会话不 join 父组合——预设层的首轮监听(router bootstrap 等)不会作用于它
     if (joinPreset) {
@@ -919,6 +1077,11 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
     setup,
   });
   const inverses = [];
+  const descriptorState = () => ({
+    descriptorAppended: descriptorInstall?.appended() === true,
+    descriptorArmed: descriptorInstall?.armed() === true,
+    descriptorPath: descriptorInstall?.path() ?? null,
+  });
   try {
     diagLog("enhance-child-ready", {
       sessionId,
@@ -926,7 +1089,13 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
       childCwd: handle.agent?.session?.header?.cwd ?? null,
       metaCwd: cwd ?? null,
       joinPreset,
+      ...descriptorState(),
     });
+    if (descriptorInstall?.armed() !== true) {
+      // 两个落点都不可用 ⇒ 该子会话必然被判 corrupt;必须留痕(旧实现只 warn 且被吞)
+      ctx.logger?.warn("[dsh-prompt-enhancer] 子代理身份未追加成功,该子会话会显示为「会话记录损坏」: " + childId);
+      diagLog("enhance-child-descriptor-unarmed", { sessionId, childId, joinPreset, ...descriptorState() });
+    }
     // 绑定父工作区,保证 glob/grep/read 落在仓库根上
     const workspace = (ctx.workspaceRegistry?.list?.() ?? [])
       .find((w) => Array.isArray(w?.sessionIds) && w.sessionIds.includes(sessionId));
@@ -936,11 +1105,11 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
     }
     handle.agent.followup(userMessage(payload));
     await waitForTurn(handle.agent, CHILD_TIMEOUT_MS, signal, "强化子会话");
-    const text = lastAssistantText(handle.agent.session.events);
+    const text = lastAssistantText(sessionEvents(handle.agent.session));
     if (text === "") {
       // 子会话回合结束却无文本:回合内部错误此前被吞掉(只读助手文本)。
       // 把全部事件落盘诊断,并尽量从错误事件里提炼一句可读原因。
-      const events = handle.agent.session.events;
+      const events = sessionEvents(handle.agent.session);
       const digest = events.map((event) => ({ type: event?.type, data: truncateJson(event?.data, 600) }));
       const errorEvent = [...events].reverse().find((event) => String(event?.type ?? "").includes("error"));
       const rawCause = errorEvent === undefined ? undefined : (errorEvent.data?.error?.message ?? errorEvent.data?.message ?? errorEvent.data?.error);
@@ -957,8 +1126,23 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
       error.noText = true;
       throw error;
     }
-    return { text, truncated: childOutputTruncated(handle.agent.session.events) };
+    return { text, truncated: childOutputTruncated(sessionEvents(handle.agent.session)) };
   } finally {
+    // 身份审计:以会话自身事件为准(不信安装器的自称),descriptor 缺失即注定 corrupt
+    try {
+      const events = sessionEvents(handle.agent?.session);
+      const descriptorEvents = events.filter((event) => event?.type === "subagent/descriptor").length;
+      diagLog("enhance-child-descriptor-final", {
+        sessionId,
+        childId,
+        joinPreset,
+        descriptorEvents,
+        ...descriptorState(),
+      });
+      if (descriptorEvents === 0) {
+        ctx.logger?.warn("[dsh-prompt-enhancer] 强化子会话缺少 subagent/descriptor,会被判「会话记录损坏」: " + childId);
+      }
+    } catch { /* 审计失败不影响主流程 */ }
     for (const inverse of inverses.reverse()) {
       try {
         await inverse();

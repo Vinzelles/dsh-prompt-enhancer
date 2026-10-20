@@ -19,9 +19,24 @@ dsh plugin --profile web add github:Vinzelles/dsh-prompt-enhancer
 
 装完重启 `dsh web`（或刷新页面），输入框右侧就能看到 ✦。
 
+## 宿主兼容
+
+| 宿主版本 | 状态 |
+| --- | --- |
+| **0.2.0+**（含 0.2.1-rc.2，当前基线） | ✅ 完整支持 |
+| ≤ 0.1.3 | ❌ 不支持——`peerDependencies` 已声明 `^0.2.0-rc.2`，宿主在加载前即按版本不满足拒绝；请升级宿主，或留用插件 0.1.3 |
+
+0.2.x 相对 0.1.x 有三处承重变化，本插件均已按新契约重写：
+
+- **设置面板**：`installSettingsSection` / `settingsNamespace` / `ctx.settings.installSection` 在 0.2.x 全部移除，官方通道改为「插件导出 `Config` schema（可调字段标 `.volatile()`）+ profile patch 落配置」。面板表单由宿主 `dsh-settings` 从 `entry.fiber.runtime.Config` 反投影生成，命名空间即 profile patch 的 entry id（本插件为 `prompt-enhancer`）；未标 volatile 的字段不会出现在面板里。插件把三个可调项（`model` / `intensity` / `outputEnglish`）声明为 volatile 字段，`apply(ctx, config)` 的第二参即校验后的配置；volatile 值运行时以引用对象（`{get()}`）下发，插件逐键取值，改设置即时生效、无需重启。
+- **客户端设置槽位**：`settings.plugin.item` 槽位与 `settingsScope` 客户端服务在 0.2.x 均已移除。设置卡片改走 `ctx.configForms.get("prompt-enhancer")`（`ConfigFormController`：`getSnapshot` / `subscribe` / `set` / `unset` / `mutate`，写操作返回 `Promise<boolean>`——宿主拒绝时是 `false` 而非抛异常）+ `settings.plugins.tab` 槽位（注册项用 `id` + `label`，不再是 `key`）。输入框按钮所在槽位 `conversation.input.right` 未变。
+- **宿主依赖树定位**：裸 `@deepseek-ai/*` import 的解析规则改为「插件 `package.json` 的 `peerDependencies` 必须声明该包名」；插件按「profile node_modules → `DSH_HOME` 上溯 → 包自身上溯 → 宿主 bin（`process.argv[1]`）上溯 → 扫 `%APPDATA%` 下所有含 `dependencies/dsh/node_modules` 的发行版目录 → `.pnpm` store」逐级探测宿主包目录，桌面端目录名（如 `dsh-tauri`）不再写死。
+
+强化子会话依赖宿主的子代理身份契约（`subagent/descriptor`）：身份事件缺失或版本不匹配，子会话都会被宿主判为「会话记录损坏」。本插件不写死该契约——① **版本**：加载时从宿主依赖树的 `@deepseek-ai/dsh-subagent` 动态解析真实契约（读常量 → 文件扫描 → 包版本 semver 推断三级兜底），0.2.1-rc.2 下解析为 `3`（通道 `import`，取自宿主 `lib/types/descriptor.js`）；② **落点**：身份事件写在 Agent 实例上（setup 第二参，退化时用 `agent/pre-step` 载荷里的 `agent`），与官方子代理驱动同形——ctx 上并不存在 `agent` 服务（服务名是 `agents`），写错落点会静默丢失整条身份事件。追加结果在 `~/.dsh/super-injector/prompt-enhancer-diag.log` 可见（`enhance-child-ready` / `enhance-child-descriptor-final` 的 `descriptorAppended` / `descriptorPath` / `descriptorEvents`），身份未落盘时另有 `enhance-child-descriptor-unarmed` 信标，不会退化成 UI 里一句「会话记录损坏」。
+
 ## 强化程度与模型
 
-设置 → 插件 → 插件配置 → 「提示词强化」卡片：
+设置 → 内置插件 → Tab「提示词强化」：
 
 | 强度 | 效果 |
 | --- | --- |

@@ -6,7 +6,50 @@ window.__ModuleLoader__.load({
 
     const { jsx } = require("react/jsx-runtime");
     const { useState, useRef, useEffect } = require("react");
-    const { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
+    /* ═══════════════ 平台快照 store 引擎(0.1.1 / 0.1.2+ 双版解析) ═══════════════ */
+    // 0.1.2 删除了 @deepseek-ai/dsh-client-runtime 包,改为在启动壳里预置
+    // @deepseek-ai/dsh-client-store 平台种子;两版拼写没有交集,只能在运行时逐条查表。
+    // 工厂顶部的静态 require 一旦落空,client-modules 抛「require(...) missed the module
+    // table」并中止整条 loader entry——插件整体不加载,不是局部降级。
+    function fallbackSnapshotStore(init) {
+      let state = init;
+      const listeners = new Set();
+      return {
+        getSnapshot: () => state,
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => { listeners.delete(listener); };
+        },
+        update: (mutator) => {
+          const draft = Object.create(Object.getPrototypeOf(state), Object.getOwnPropertyDescriptors(state));
+          mutator(draft);
+          state = draft;
+          for (const listener of [...listeners]) listener(state);
+        },
+        set: (next) => {
+          state = next;
+          for (const listener of [...listeners]) listener(state);
+        },
+      };
+    }
+    function resolveCreateSnapshotStore() {
+      const candidates = ["@deepseek-ai/dsh-client-store", "@deepseek-ai/dsh-client-runtime/client"];
+      const tried = [];
+      for (const specifier of candidates) {
+        try {
+          const engine = require(specifier);
+          if (typeof engine?.createSnapshotStore === "function") return engine.createSnapshotStore;
+          tried.push(specifier + ":无 createSnapshotStore 导出");
+        } catch (error) {
+          tried.push(specifier + ":" + (error?.message ?? String(error)));
+        }
+      }
+      // 两个拼写都查不到(未来内核改种子名):退回本地等价实现——hooks 契约只要求
+      // getSnapshot/subscribe 一对,插件自身状态不依赖平台内部。
+      console.warn("[prompt-enhancer] 平台快照 store 引擎缺失,已退回本地实现", tried);
+      return fallbackSnapshotStore;
+    }
+    const createSnapshotStore = resolveCreateSnapshotStore();
 
     /* ═══════════════ 诊断信标(轻量监控,落盘 ~/.dsh/super-injector/prompt-enhancer-diag.log) ═══════════════ */
     const DIAG_URL = "/prompt-enhancer/diag";
@@ -292,9 +335,12 @@ window.__ModuleLoader__.load({
     const MODELS_ENDPOINT = "/prompt-enhancer/models";
     const INTENSITIES = ["low", "medium", "high"];
 
-    /** 每插件单例控制器:settingsScope 绑定 + 模型目录拉取 + staged 表单。 */
+    /** 每插件单例控制器:Config 表单 + 模型目录拉取 + staged 表单。
+     *  0.2.x 起设置表单由宿主 configForms 服务提供(dsh-client-ui-settings):
+     *  get(namespace) 返回 ConfigFormController,namespace 是 profile patch 里的
+     *  entry id(与本插件 SETTINGS_NS 一致),不是包名。 */
     function settingsCardControllerFor(ctx) {
-      const scope = ctx.settingsScope.bind({ namespace: SETTINGS_NS });
+      const scope = ctx.configForms.get(SETTINGS_NS);
       const store = createSnapshotStore({
         status: "loading", // loading | ready | unavailable
         writable: true,
@@ -317,7 +363,9 @@ window.__ModuleLoader__.load({
           state.user = snapshot.user ?? {};
         });
       };
-      scope.subscribe(publish);
+      // 订阅跟随插件生命周期(effect 的 dispose = configForms 的 unsubscribe),
+      // 避免 HMR/停用插件后仍持有宿主 mirror 订阅。
+      ctx.effect(() => scope.subscribe(publish), "@dsh-external/dsh-prompt-enhancer: settings store");
       publish();
 
       const loadModels = () => {
@@ -370,10 +418,12 @@ window.__ModuleLoader__.load({
           const selection = staged.model;
           try {
             if (selection === null) {
-              await scope.unset("model");
+              // ConfigFormController 的写操作返回 boolean(宿主是否接受),不抛异常:
+              // 被拒(如并发 revision 冲突且 recover 失败)时必须显式判 false。
+              if (await scope.unset("model") === false) landed = false;
               landed = landed && !Object.hasOwn(scope.getSnapshot().user ?? {}, "model");
             } else {
-              await scope.set("model", selection);
+              if (await scope.set("model", selection) === false) landed = false;
               const stored = scope.getSnapshot().user?.model;
               landed =
                 landed &&
@@ -388,7 +438,7 @@ window.__ModuleLoader__.load({
         }
         if (Object.hasOwn(staged, "intensity") && staged.intensity !== snapshot.value.intensity) {
           try {
-            await scope.set("intensity", staged.intensity);
+            if (await scope.set("intensity", staged.intensity) === false) landed = false;
             landed = landed && scope.getSnapshot().user?.intensity === staged.intensity;
           } catch {
             landed = false;
@@ -396,7 +446,7 @@ window.__ModuleLoader__.load({
         }
         if (Object.hasOwn(staged, "outputEnglish") && staged.outputEnglish !== (snapshot.value.outputEnglish === true)) {
           try {
-            await scope.set("outputEnglish", staged.outputEnglish);
+            if (await scope.set("outputEnglish", staged.outputEnglish) === false) landed = false;
             landed = landed && (scope.getSnapshot().user?.outputEnglish === true) === staged.outputEnglish;
           } catch {
             landed = false;
@@ -619,11 +669,11 @@ window.__ModuleLoader__.load({
     }
 
     /* ═══════════════ 插件入口 ═══════════════ */
-    // settingsScope/connection/remote 必须在静态 inject 声明:cordis 严格模式下
+    // configForms/connection/remote 必须在静态 inject 声明:cordis 严格模式下
     // 属性访问未注入的服务会抛 "cannot get property X without inject"(实测)。
-    // 本部署 ui-settings 提供 settingsScope,设置卡片依赖它;服务缺失时整个插件
+    // 本部署 ui-settings 提供 configForms,设置卡片依赖它;服务缺失时整个插件
     // fiber 会挂起等待——与官方 ui-settings-plugins 的行为一致,属合理依赖。
-    const inject = ["slots", "conversation", "locale", "settingsScope", "connection", "remote"];
+    const inject = ["slots", "conversation", "locale", "configForms", "connection", "remote"];
 
     const zh = {
       enhance: "强化提示词",
@@ -726,15 +776,19 @@ window.__ModuleLoader__.load({
           inject: (sessionId) => controllerFor(sessionId).face,
         }, EnhanceButtons);
       }), "@dsh-external/dsh-prompt-enhancer: input buttons");
-      // 设置卡片(设置 → 插件 → 插件配置):key 必须等于 host 注册的 settings 命名空间
+      // 设置卡片(设置 → 内置插件 → 「提示词强化」Tab):0.2.x 起 settings.plugin.item
+      // 槽位已不存在,官方开放的是 settings.plugins.tab(list 槽,注册项用 id 而非 key)。
+      // 用 configForms.whileServed 跟随宿主是否真的服务该 namespace:未服务时不注册,
+      // 免得用户看到一个永远空白的 Tab(与官方 ui-settings-* 的接线同构)。
       try {
         const settingsCard = settingsCardControllerFor(ctx);
-        ctx.effect(() => ctx.slots.inject("settings.plugin.item", () => ctx.slots.register({
-          name: "settings.plugin.item",
-          key: SETTINGS_NS,
+        ctx.effect(() => ctx.configForms.whileServed([SETTINGS_NS], () => ctx.slots.inject("settings.plugins.tab", () => ctx.slots.register({
+          name: "settings.plugins.tab",
+          id: SETTINGS_NS,
+          label: () => ctx.locale.bind(NS)("settingsTitle"),
           locale: NS,
           inject: () => settingsCard.face,
-        }, SettingsCard)), "@dsh-external/dsh-prompt-enhancer: settings card");
+        }, SettingsCard))), "@dsh-external/dsh-prompt-enhancer: settings card");
       } catch (error) {
         beacon("settings-card-failed", { message: String(error?.message ?? error) });
       }

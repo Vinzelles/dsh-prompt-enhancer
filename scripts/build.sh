@@ -12,6 +12,9 @@ mkdir -p lib
 echo "=== 拷贝 host(src/index.js → lib/index.js) ==="
 cp src/index.js lib/index.js
 
+echo "=== 拷贝 config(src/config.js → lib/config.js) ==="
+cp src/config.js lib/config.js
+
 echo "=== 拷贝 client(src/client/index.js → lib/client.js) ==="
 cp src/client/index.js lib/client.js
 
@@ -23,12 +26,29 @@ if (!host.includes('export function apply')) {
   console.error('lib/index.js 缺 apply 导出');
   process.exit(1);
 }
+if (!host.includes('./config.js')) {
+  console.error('lib/index.js 未引用 ./config.js(0.2.x 配置通道缺失)');
+  process.exit(1);
+}
+const config = fs.readFileSync('lib/config.js', 'utf8');
+if (!config.includes('export const Config')) {
+  console.error('lib/config.js 缺 Config 导出(宿主 SettingsForms 读不到表单)');
+  process.exit(1);
+}
+if (!config.includes('export function readEnhancerConfig')) {
+  console.error('lib/config.js 缺 readEnhancerConfig 导出');
+  process.exit(1);
+}
 const client = fs.readFileSync('lib/client.js', 'utf8');
 if (!client.includes('__ModuleLoader__')) {
   console.error('lib/client.js 缺 __ModuleLoader__ 特征(注入器校验必挂)');
   process.exit(1);
 }
-console.log('host ✓ / client ✓');
+if (!client.includes('configForms')) {
+  console.error('lib/client.js 缺 configForms(0.2.x 设置表单服务)');
+  process.exit(1);
+}
+console.log('host ✓ / config ✓ / client ✓');
 "
 
 echo "=== Build complete ==="
