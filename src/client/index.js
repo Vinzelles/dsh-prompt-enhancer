@@ -5,7 +5,44 @@ window.__ModuleLoader__.load({
     var exports = module.exports;
 
     const { jsx } = require("react/jsx-runtime");
-    const { useState, useRef, useEffect } = require("react");
+    const { useState, useRef, useEffect, useSyncExternalStore } = require("react");
+    const { createPortal } = require("react-dom");
+    const CODEX_PREDICTION_MODELS = Object.freeze(["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra"]);
+    function codexPredictionOwns({ provider, model }) {
+      return provider === "openai-codex" && CODEX_PREDICTION_MODELS.includes(model);
+    }
+    function suggestionConsumed(suggestion, draft) {
+      return suggestion !== "" && typeof draft === "string" && draft.trim() !== "" && draft !== suggestion;
+    }
+    function suggestionView(input) {
+      const current = input.loadedKey === input.turnKey;
+      const quiet = input.enabled === true && input.busy !== true && input.empty === true && input.attachmentCount === 0 && (input.composerPhase === "plain" || input.composerPhase === undefined) && input.turnKey !== "" && input.codexOwned !== true;
+      if (!quiet || input.dismissed === true || input.consumed === true) return { request: false, showText: false, placeholder: "normal" };
+      if (current && input.phase === "ready" && input.suggestion !== "") return { request: false, showText: true, placeholder: "hidden" };
+      if (input.phase === "failed" || (input.phase === "ready" && input.suggestion === "")) return { request: false, showText: false, placeholder: "normal" };
+      return { request: true, showText: false, placeholder: "loading" };
+    }
+    /** 请求副作用该做什么:只有确实装过、且属于别的回合的旧结果才清。
+     *  注意 loadedKey 为空只表示本回合还没装载过,必须放行请求,否则会永远停在加载态。 */
+    function suggestionSync({ turnKey, loadedKey, request }) {
+      if (turnKey === "") return loadedKey === "" ? "hold" : "clear";
+      if (loadedKey === "") return request === true ? "request" : "hold";
+      if (loadedKey !== turnKey) return "clear";
+      return request === true ? "request" : "hold";
+    }
+    /** 把宿主 modelCatalog RemoteResult 或本插件 HTTP JSON 收成 groups 数组。 */
+    function catalogGroupsFromRemote(response) {
+      if (response === null || typeof response !== "object") throw new Error("bad payload");
+      if (Object.hasOwn(response, "ok")) {
+        if (response.ok !== true) {
+          const message = response.error && typeof response.error === "object" ? response.error.message : undefined;
+          throw new Error(typeof message === "string" && message !== "" ? message : "modelCatalog failed");
+        }
+        return catalogGroupsFromRemote(response.value);
+      }
+      if (!Array.isArray(response.groups)) throw new Error("bad payload");
+      return response.groups;
+    }
     /* ═══════════════ 平台快照 store 引擎(0.1.1 / 0.1.2+ 双版解析) ═══════════════ */
     // 0.1.2 删除了 @deepseek-ai/dsh-client-runtime 包,改为在启动壳里预置
     // @deepseek-ai/dsh-client-store 平台种子;两版拼写没有交集,只能在运行时逐条查表。
@@ -77,7 +114,7 @@ window.__ModuleLoader__.load({
     /* ═══════════════ 常量 ═══════════════ */
     const NS = "prompt-enhancer";
     const ENDPOINT = "/prompt-enhancer";
-    const CLIENT_TIMEOUT_MS = 160000; // 通道 B 90s + 通道 A 60s = 150s 全链路 + 余量
+    const CLIENT_TIMEOUT_MS = 70000; // 通道 A 60s + 余量
 
     /* ═══════════════ 图标(React 元素;原生 DOM 元素会触发 React error #31) ═══════════════ */
     // 强化图标:复用官方 dsh-client-ui-primitives 的 IconSparkle16 三星 sparkle 路径
@@ -150,7 +187,17 @@ window.__ModuleLoader__.load({
       ".dpe_discard:disabled{opacity:.5;cursor:default}",
       ".dpe_cardHint{color:var(--dsw-alias-label-tertiary);font-size:11px;line-height:16px}",
       ".dpe_cardError{color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}",
-      "@media (prefers-reduced-motion:reduce){.dpe_spinner{animation-duration:1.6s}}",
+      ".dpe_suggestionAnchor{display:none}",
+      ".dpe_suggestion{box-sizing:border-box;position:absolute;z-index:3;display:flex;align-items:flex-start;gap:8px;margin:0;color:var(--dsw-alias-label-caption);font-family:var(--dsw-font-family);white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;pointer-events:none;user-select:none}",
+      ".dpe_suggestionText{flex:1;min-width:0;overflow:hidden}",
+      ".dpe_suggestionTab{box-sizing:border-box;pointer-events:auto;flex:none;height:18px;border:1px solid var(--dsw-alias-border-l2);border-radius:5px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font:inherit;font-size:11px;line-height:16px;padding:0 5px;cursor:pointer}",
+      ".dpe_suggestionTab:hover{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover)}",
+      ".dpe_suggestionTab:focus-visible{box-shadow:0 0 0 2px var(--dsw-alias-border-l3);outline:none}",
+      "[data-composer-card]:has(.dpe_suggestionAnchor[data-visible=true]) [data-composer-placeholder]{visibility:hidden}",
+      // 加载态不覆盖输入层(会压住光标),改为让原生 placeholder 自己呼吸。
+      "[data-composer-card]:has(.dpe_suggestionAnchor[data-placeholder=loading]) [data-composer-placeholder]{animation:dpe_placeholderPulse 1.3s ease-in-out infinite}",
+      "@keyframes dpe_placeholderPulse{0%,100%{opacity:1}50%{opacity:.35}}",
+      "@media (prefers-reduced-motion:reduce){.dpe_spinner{animation-duration:1.6s}[data-composer-card]:has(.dpe_suggestionAnchor[data-placeholder=loading]) [data-composer-placeholder]{animation:none;opacity:.6}}",
     ].join("\n");
     const TAG_ID = "@dsh-external/dsh-prompt-enhancer/style";
     if (typeof document !== "undefined" && document.querySelector("style[data-plugin-css=" + JSON.stringify(TAG_ID) + "]") === null) {
@@ -159,6 +206,83 @@ window.__ModuleLoader__.load({
       tag.dataset.pluginCss = TAG_ID;
       tag.textContent = CSS_TEXT;
       document.head.appendChild(tag);
+    }
+
+const SUGGESTION_ENDPOINT = "/prompt-enhancer/suggestion";
+    const SUGGESTION_DELAY_MS = 600;
+    const SUGGESTION_CACHE_MS = 5 * 60 * 1000;
+    const SUGGESTION_MESSAGE_CAP = 12;
+    const SUGGESTION_CLIENT_BUDGET = 24000;
+    const suggestionCache = new Map();
+    const suggestionSuppressed = new Map();
+
+    function nodeText(node) {
+      const data = node?.data;
+      if (node?.kind === "user") {
+        const blocks = Array.isArray(data?.content) ? data.content : [];
+        return blocks.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n").trim();
+      }
+      if (node?.kind === "assistant-step") {
+        const blocks = Array.isArray(data?.blocks) ? data.blocks : [];
+        return blocks.filter((block) => block?.kind === "text" && typeof block.text === "string").map((block) => block.text).join("\n").trim();
+      }
+      return "";
+    }
+
+    function suggestionWindow(snapshot) {
+      const chat = snapshot?.views?.get?.("chat");
+      const order = Array.isArray(chat?.order) ? chat.order : [];
+      const nodes = chat?.nodes;
+      if (nodes === undefined || typeof nodes.get !== "function" || order.length === 0) return null;
+      const visible = [];
+      for (const key of order) {
+        const node = nodes.get(key);
+        if (node?.kind !== "user" && node?.kind !== "assistant-step") continue;
+        const text = nodeText(node);
+        if (text !== "") visible.push({ role: node.kind === "user" ? "user" : "assistant", text, node });
+      }
+      const last = visible[visible.length - 1];
+      if (last === undefined || last.role !== "assistant") return null;
+      const data = last.node.data ?? {};
+      if (data.status !== "settled" || data.finalNode === undefined || data.interrupted === true) return null;
+      const turn = data.turn;
+      const location = chat.timeline?.turns?.get?.(turn);
+      const turnOrder = chat.timeline?.turnOrder;
+      if (location?.status !== "closed" || !Array.isArray(turnOrder) || turnOrder[turnOrder.length - 1] !== turn) return null;
+      let used = 0;
+      const messages = [];
+      for (let i = visible.length - 1; i >= 0 && messages.length < SUGGESTION_MESSAGE_CAP && used < SUGGESTION_CLIENT_BUDGET; i -= 1) {
+        const room = SUGGESTION_CLIENT_BUDGET - used;
+        const text = visible[i].text.length <= room ? visible[i].text : visible[i].text.slice(0, room);
+        messages.unshift({ role: visible[i].role, text });
+        used += text.length;
+      }
+      return { turn, messages };
+    }
+
+    function syncSuggestionLayout(root, scroll, editor) {
+      if (root === null || scroll === null || editor === null) return;
+      const scrollRect = scroll.getBoundingClientRect();
+      const editorRect = editor.getBoundingClientRect();
+      const style = getComputedStyle(editor);
+      root.style.top = Math.max(0, editorRect.top - scrollRect.top + scroll.scrollTop) + "px";
+      root.style.left = Math.max(0, editorRect.left - scrollRect.left) + "px";
+      root.style.width = editorRect.width + "px";
+      root.style.minHeight = editorRect.height + "px";
+      root.style.paddingTop = style.paddingTop;
+      root.style.paddingBottom = style.paddingBottom;
+      root.style.paddingLeft = style.paddingLeft;
+      root.style.paddingRight = style.paddingRight;
+      root.style.fontSize = style.fontSize;
+      root.style.lineHeight = style.lineHeight;
+      root.style.fontFamily = style.fontFamily;
+      root.style.letterSpacing = style.letterSpacing;
+    }
+
+    function acceptSuggestion(actions, text) {
+      if (typeof actions?.captureInsertion !== "function" || typeof actions?.insertText !== "function") return false;
+      const span = actions.captureInsertion();
+      return actions.insertText(text, span) === true;
     }
 
     /* ═══════════════ 每会话控制器(两个槽条目共享同一 face 状态) ═══════════════ */
@@ -244,7 +368,25 @@ window.__ModuleLoader__.load({
     }
 
     /* ═══════════════ 组件:强化 / 还原 按钮 + 强化中加载遮罩(挂 conversation.input.right 槽) ═══════════════ */
-    function EnhanceButtons({ usePromptEnhancer, useInput, useSessions, inputActions, sessionId, t }) {
+    function usePromptEnhancerSettings(selector) {
+      const store = settingsFace?.hooks?.promptEnhancerSettings;
+      if (store === undefined || typeof selector !== "function") return false;
+      const [value, setValue] = useState(() => selector(store.getSnapshot()));
+      useEffect(() => store.subscribe(() => setValue(selector(store.getSnapshot()))), [store]);
+      return value;
+    }
+
+    function EnhanceButtons({ usePromptEnhancer, useInput, useSessions, useConversation, inputActions, sessionId, t, directory }) {
+      const suggestionEnabled = usePromptEnhancerSettings((state) => state.value?.nextSuggestion === true) === true;
+      const conversation = typeof useConversation === "function" ? useConversation((state) => state) : null;
+      const attachmentCount = useInput((state) => (Array.isArray(state.attachmentIds) ? state.attachmentIds.length : 0));
+      const phase = useInput((state) => state.phase);
+      const [suggestion, setSuggestion] = useState("");
+      const [loadedKey, setLoadedKey] = useState("");
+      const [suggestionPhase, setSuggestionPhase] = useState("idle");
+      const [scroll, setScroll] = useState(null);
+      const requestSerial = useRef(0);
+      const portalRef = useRef(null);
       const busy = usePromptEnhancer((state) => state.busy);
       const error = usePromptEnhancer((state) => state.error);
       const original = usePromptEnhancer((state) => state.original);
@@ -280,6 +422,140 @@ window.__ModuleLoader__.load({
       // 还原入口:仅强化成功且草稿仍是增强文本(严格版)时显示
       const canRestore = !busy && original !== null && enhanced !== null && draft === enhanced;
       const empty = draft.trim() === "";
+      // slot 组件拿不到 modelDirectories 服务本身;Codex 插件把 directoryFor(sessionId).store
+      // 显式塞进 overlay props。我们同样从闭包注入 directory,避免读到 undefined 后永远不让路。
+      const modelSelection = useSyncExternalStore(
+        (listener) => typeof directory?.subscribe === "function" ? directory.subscribe(listener) : () => {},
+        () => directory?.getSnapshot?.()?.current ?? null,
+        () => null,
+      );
+      const settled = suggestionWindow(conversation);
+      const turnKey = settled === null || sessionId === undefined ? "" : sessionId + ":" + settled.turn;
+      const dismissed = turnKey !== "" && suggestionSuppressed.get(sessionId) === turnKey;
+      const consumed = suggestionConsumed(suggestion, draft);
+      // Codex 层只在有预测文本后才挂 DOM,等它出现再让路会叠两层。白名单模型会话直接让路。
+      const codexOwned = codexPredictionOwns({
+        provider: modelSelection?.provider,
+        model: modelSelection?.model,
+      });
+      const view = suggestionView({
+        enabled: suggestionEnabled,
+        busy,
+        empty,
+        attachmentCount,
+        composerPhase: phase,
+        turnKey,
+        dismissed,
+        consumed,
+        codexOwned,
+        phase: suggestionPhase,
+        suggestion,
+        loadedKey,
+      });
+      const visible = view.showText && scroll !== null;
+
+      const acceptCurrent = () => {
+        if (!visible) return false;
+        return acceptSuggestion(inputActions, suggestion);
+      };
+
+      useEffect(() => {
+        const card = document.querySelector("[data-composer-card]");
+        setScroll(card?.querySelector("[data-input-scroll]") ?? null);
+      }, [sessionId, view.placeholder, conversation]);
+
+      useEffect(() => {
+        if (!visible || portalRef.current === null || scroll === null) return undefined;
+        const editor = scroll.querySelector("[data-composer-input]");
+        const place = () => syncSuggestionLayout(portalRef.current, scroll, editor);
+        place();
+        const observer = typeof ResizeObserver === "function" ? new ResizeObserver(place) : null;
+        if (editor !== null) observer?.observe(editor);
+        observer?.observe(scroll);
+        scroll.addEventListener("scroll", place);
+        return () => {
+          observer?.disconnect();
+          scroll.removeEventListener("scroll", place);
+        };
+      }, [visible, scroll, suggestion]);
+
+      useEffect(() => {
+        // 只清掉属于别的回合的旧建议:正在显示本回合结果时 view.request 也是 false,
+        // 在这里清会把刚显示的建议擦掉(表现为一闪而过)。
+        const action = suggestionSync({ turnKey, loadedKey, request: view.request === true && settled !== null });
+        if (action === "clear") {
+          if (loadedKey !== "") {
+            setSuggestion("");
+            setLoadedKey("");
+            setSuggestionPhase("idle");
+          }
+          return undefined;
+        }
+        if (action === "hold") return undefined;
+        const cached = suggestionCache.get(turnKey);
+        if (cached !== undefined && Date.now() - cached.at < SUGGESTION_CACHE_MS) {
+          setSuggestion(cached.text);
+          setLoadedKey(turnKey);
+          setSuggestionPhase(cached.text === "" ? "failed" : "ready");
+          return undefined;
+        }
+        const serial = requestSerial.current + 1;
+        requestSerial.current = serial;
+        const abort = new AbortController();
+        const timer = setTimeout(() => {
+          setSuggestionPhase("loading");
+          fetch(SUGGESTION_ENDPOINT, {
+            method: "POST",
+            headers: { "content-type": "application/json", accept: "application/json" },
+            body: JSON.stringify({ sessionId, turn: settled.turn, messages: settled.messages }),
+            signal: AbortSignal.any([abort.signal, AbortSignal.timeout(70000)]),
+          }).then(async (res) => {
+            const data = await res.json().catch(() => ({}));
+            if (requestSerial.current !== serial || abort.signal.aborted) return;
+            if (!res.ok || typeof data.suggestion !== "string" || data.suggestion.trim() === "") {
+              suggestionCache.set(turnKey, { text: "", at: Date.now() });
+              setSuggestion("");
+              setLoadedKey(turnKey);
+              setSuggestionPhase("failed");
+              if (!res.ok) beacon("suggestion-failed", { status: res.status });
+              return;
+            }
+            suggestionCache.set(turnKey, { text: data.suggestion, at: Date.now() });
+            setSuggestion(data.suggestion);
+            setLoadedKey(turnKey);
+            setSuggestionPhase("ready");
+          }).catch((err) => {
+            if (requestSerial.current !== serial || err?.name === "AbortError") return;
+            suggestionCache.set(turnKey, { text: "", at: Date.now() });
+            setSuggestion("");
+            setLoadedKey(turnKey);
+            setSuggestionPhase("failed");
+            beacon("suggestion-failed", { message: String(err?.message ?? err) });
+          });
+        }, SUGGESTION_DELAY_MS);
+        return () => {
+          clearTimeout(timer);
+          abort.abort();
+        };
+      }, [view.request, turnKey, loadedKey, sessionId]);
+
+      useEffect(() => {
+        const onKeyDown = (event) => {
+          if (event.key === "Escape" && visible) {
+            suggestionSuppressed.set(sessionId, turnKey);
+            setSuggestion("");
+            return;
+          }
+          if (event.key !== "Tab" || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing || event.defaultPrevented) return;
+          const editor = scroll?.querySelector("[data-composer-input]") ?? null;
+          if (editor === null || (document.activeElement !== editor && !editor.contains(document.activeElement))) return;
+          if (!visible) return;
+          event.preventDefault();
+          acceptCurrent();
+        };
+        document.addEventListener("keydown", onKeyDown);
+        return () => document.removeEventListener("keydown", onKeyDown);
+      }, [visible, suggestion, scroll, sessionId, turnKey]);
 
       const onEnhance = () => {
         if (busy || empty) return;
@@ -295,6 +571,26 @@ window.__ModuleLoader__.load({
         "data-prompt-enhancer": "",
         "aria-busy": busy,
         children: [
+          jsx("span", {
+            className: "dpe_suggestionAnchor",
+            "data-visible": visible ? "true" : undefined,
+            "data-placeholder": view.placeholder === "loading" ? "loading" : undefined,
+            "data-prompt-enhancer-suggestion": "",
+          }),
+          visible ? createPortal(jsx("div", {
+            ref: portalRef,
+            className: "dpe_suggestion",
+            children: [
+              jsx("span", { className: "dpe_suggestionText", children: suggestion }),
+              jsx("button", {
+                type: "button",
+                className: "dpe_suggestionTab",
+                onMouseDown: (event) => event.preventDefault(),
+                onClick: () => acceptCurrent(),
+                children: "Tab",
+              }),
+            ],
+          }), scroll) : null,
           jsx("button", {
             type: "button",
             className: "dpe_iconButton",
@@ -329,6 +625,8 @@ window.__ModuleLoader__.load({
         ],
       });
     }
+
+    let settingsFace = null;
 
     /* ═══════════════ 设置卡片:强化模型 + 强化程度(设置 → 插件 → 插件配置) ═══════════════ */
     const SETTINGS_NS = "prompt-enhancer";
@@ -368,27 +666,52 @@ window.__ModuleLoader__.load({
       ctx.effect(() => scope.subscribe(publish), "@dsh-external/dsh-prompt-enhancer: settings store");
       publish();
 
+      let modelsGeneration = 0;
       const loadModels = () => {
+        const generation = ++modelsGeneration;
         store.update((state) => {
           state.modelsStatus = "loading";
           state.modelsFailed = null;
         });
+        const applyGroups = (groups) => {
+          if (generation !== modelsGeneration) return;
+          store.update((state) => {
+            state.modelsGroups = groups;
+            state.modelsStatus = "ready";
+          });
+        };
+        const fail = (err) => {
+          if (generation !== modelsGeneration) return;
+          store.update((state) => {
+            state.modelsStatus = "error";
+            state.modelsFailed = err instanceof Error ? err.message : String(err);
+          });
+        };
+        // 设置卡片不在会话槽,不得碰 session 子服务(可选链也会被 cordis 判未注入)。
+        // 目录走本插件 GET /models(已合并 listProviders + listConfigurableProviders);
+        // 刷新仍用已注入的 ctx.remote.$on。
         fetch(MODELS_ENDPOINT, { headers: { accept: "application/json" } })
           .then((res) => res.json().catch(() => ({})))
-          .then((data) => {
-            if (!Array.isArray(data?.groups)) throw new Error("bad payload");
-            store.update((state) => {
-              state.modelsGroups = data.groups;
-              state.modelsStatus = "ready";
-            });
-          })
-          .catch((err) => {
-            store.update((state) => {
-              state.modelsStatus = "error";
-              state.modelsFailed = err instanceof Error ? err.message : String(err);
-            });
-          });
+          .then(catalogGroupsFromRemote)
+          .then(applyGroups)
+          .catch(fail);
       };
+      loadModels();
+      ctx.effect(() => {
+        const remote = ctx.remote;
+        if (remote === undefined || typeof remote.$on !== "function") return undefined;
+        const reload = () => loadModels();
+        const offs = [
+          remote.$on("llm/adapters-updated", reload),
+          remote.$on("llm/models-updated", reload),
+          remote.$on("settings/document-updated", reload),
+          remote.$on("credentials/record-updated", reload),
+          remote.$on("credentials/reference-updated", reload),
+        ];
+        return () => {
+          for (const off of offs) if (typeof off === "function") off();
+        };
+      }, "@dsh-external/dsh-prompt-enhancer: catalog refresh");
 
       const editModel = (selection) => {
         store.update((state) => {
@@ -403,6 +726,11 @@ window.__ModuleLoader__.load({
       const editOutputEnglish = (value) => {
         store.update((state) => {
           state.staged = { ...state.staged, outputEnglish: Boolean(value) };
+        });
+      };
+      const editNextSuggestion = (value) => {
+        store.update((state) => {
+          state.staged = { ...state.staged, nextSuggestion: Boolean(value) };
         });
       };
       const save = async () => {
@@ -452,6 +780,14 @@ window.__ModuleLoader__.load({
             landed = false;
           }
         }
+        if (Object.hasOwn(staged, "nextSuggestion") && staged.nextSuggestion !== (snapshot.value.nextSuggestion === true)) {
+          try {
+            if (await scope.set("nextSuggestion", staged.nextSuggestion) === false) landed = false;
+            landed = landed && (scope.getSnapshot().user?.nextSuggestion === true) === staged.nextSuggestion;
+          } catch {
+            landed = false;
+          }
+        }
         store.update((state) => {
           state.saving = false;
           state.failed = !landed;
@@ -471,6 +807,7 @@ window.__ModuleLoader__.load({
           editModel,
           editIntensity,
           editOutputEnglish,
+          editNextSuggestion,
           save,
           discard,
           loadModels,
@@ -480,7 +817,7 @@ window.__ModuleLoader__.load({
 
     /** 设置卡片组件:模型三级联动(provider→model→effort)+ 强度三档 + 转换英文开关。
      *  face 注入的 editModel/editIntensity/editOutputEnglish/save/discard/loadModels 以顶层 props 到达。 */
-    function SettingsCard({ usePromptEnhancerSettings, t, editModel, editIntensity, editOutputEnglish, save, discard, loadModels }) {
+    function SettingsCard({ usePromptEnhancerSettings, t, editModel, editIntensity, editOutputEnglish, editNextSuggestion, save, discard, loadModels }) {
       const state = usePromptEnhancerSettings((snapshot) => snapshot);
 
       // 打开设置页即拉取模型目录
@@ -492,6 +829,7 @@ window.__ModuleLoader__.load({
       const stagedModel = Object.hasOwn(state.staged, "model") ? state.staged.model : (state.value.model ?? null);
       const stagedIntensity = Object.hasOwn(state.staged, "intensity") ? state.staged.intensity : (state.value.intensity ?? "medium");
       const stagedOutputEnglish = Object.hasOwn(state.staged, "outputEnglish") ? state.staged.outputEnglish === true : state.value.outputEnglish === true;
+      const stagedNextSuggestion = Object.hasOwn(state.staged, "nextSuggestion") ? state.staged.nextSuggestion === true : state.value.nextSuggestion === true;
       const selectedProvider = stagedModel?.provider ?? "";
       const providerGroup = state.modelsGroups.find((group) => group.id === selectedProvider) ?? null;
       const selectedModelId = stagedModel?.model ?? "";
@@ -531,7 +869,8 @@ window.__ModuleLoader__.load({
             (stagedModel.reasoningEffort ?? "") !== (state.value.model.reasoningEffort ?? ""));
       const intensityDirty = Object.hasOwn(state.staged, "intensity") && stagedIntensity !== state.value.intensity;
       const outputEnglishDirty = Object.hasOwn(state.staged, "outputEnglish") && stagedOutputEnglish !== (state.value.outputEnglish === true);
-      const dirty = modelDirty || intensityDirty || outputEnglishDirty;
+      const nextSuggestionDirty = Object.hasOwn(state.staged, "nextSuggestion") && stagedNextSuggestion !== (state.value.nextSuggestion === true);
+      const dirty = modelDirty || intensityDirty || outputEnglishDirty || nextSuggestionDirty;
 
       const modelField = jsx("div", {
         className: "dpe_field",
@@ -627,6 +966,29 @@ window.__ModuleLoader__.load({
         ],
       });
 
+      const nextSuggestionField = jsx("div", {
+        className: "dpe_field",
+        children: [
+          jsx("div", {
+            className: "dpe_toggleRow",
+            children: [
+              jsx("span", { className: "dpe_fieldLabel", children: t("nextSuggestionLabel") }),
+              jsx("button", {
+                type: "button",
+                role: "switch",
+                "aria-checked": stagedNextSuggestion,
+                "aria-label": t("nextSuggestionLabel"),
+                className: "dpe_switch",
+                "data-on": stagedNextSuggestion ? "true" : undefined,
+                disabled: readonly,
+                onClick: () => editNextSuggestion(!stagedNextSuggestion),
+              }),
+            ],
+          }),
+          jsx("span", { className: "dpe_cardHint", children: t("nextSuggestionHint") }),
+        ],
+      });
+
       return jsx("div", {
         className: "dpe_card",
         "data-prompt-enhancer-settings": "",
@@ -641,6 +1003,7 @@ window.__ModuleLoader__.load({
           modelField,
           intensityField,
           outputEnglishField,
+          nextSuggestionField,
           state.failed ? jsx("span", { className: "dpe_cardError", children: t("saveFailed") }) : null,
           jsx("div", {
             className: "dpe_cardFoot",
@@ -673,7 +1036,7 @@ window.__ModuleLoader__.load({
     // 属性访问未注入的服务会抛 "cannot get property X without inject"(实测)。
     // 本部署 ui-settings 提供 configForms,设置卡片依赖它;服务缺失时整个插件
     // fiber 会挂起等待——与官方 ui-settings-plugins 的行为一致,属合理依赖。
-    const inject = ["slots", "conversation", "locale", "configForms", "connection", "remote"];
+    const inject = ["slots", "conversation", "locale", "configForms", "connection", "remote", "modelDirectories"];
 
     const zh = {
       enhance: "强化提示词",
@@ -683,7 +1046,7 @@ window.__ModuleLoader__.load({
       enhancing: "正在强化提示词…",
       cancel: "取消",
       settingsTitle: "提示词强化",
-      settingsDescription: "配置「强化」使用的模型、输出强度与输出语言。",
+      settingsDescription: "配置「强化」使用的模型、输出强度、输出语言，以及下一轮建议。",
       modelLabel: "强化模型",
       modelFollowSession: "跟随会话默认（推荐）",
       modelProvider: "提供方",
@@ -699,6 +1062,8 @@ window.__ModuleLoader__.load({
       intensityHighHint: "充分展开，可附参考文件",
       outputEnglishLabel: "转换英文",
       outputEnglishHint: "开启后，强化结果将自动输出为英文提示词（参考文件节标题为「## Reference Files」）。",
+      nextSuggestionLabel: "下一轮建议",
+      nextSuggestionHint: "一轮结束后，在空输入框显示一条可继续发送的草稿。Tab 填入，不自动发送。会额外调用模型。",
       save: "保存",
       saving: "保存中…",
       discard: "放弃修改",
@@ -717,7 +1082,7 @@ window.__ModuleLoader__.load({
       enhancing: "Enhancing prompt…",
       cancel: "Cancel",
       settingsTitle: "Prompt Enhancer",
-      settingsDescription: "Configure the model, output intensity, and output language used by Enhance.",
+      settingsDescription: "Configure the model, intensity, output language, and next-turn suggestion used by Enhance.",
       modelLabel: "Enhancement model",
       modelFollowSession: "Follow session default (recommended)",
       modelProvider: "Provider",
@@ -733,6 +1098,8 @@ window.__ModuleLoader__.load({
       intensityHighHint: "Full expansion, may include references",
       outputEnglishLabel: "Translate to English",
       outputEnglishHint: "When on, the enhanced prompt is always output in English (reference section heading becomes “## Reference Files”).",
+      nextSuggestionLabel: "Next suggestion",
+      nextSuggestionHint: "After a turn ends, show one continuable draft in the empty input. Tab fills it and does not send. This makes an extra model call.",
       save: "Save",
       saving: "Saving…",
       discard: "Discard",
@@ -773,7 +1140,11 @@ window.__ModuleLoader__.load({
           id: "prompt-enhancer-buttons",
           order: 60,
           locale: NS,
-          inject: (sessionId) => controllerFor(sessionId).face,
+          inject: (sessionId) => ({
+            ...controllerFor(sessionId).face,
+            ...(settingsFace === null ? {} : { hooks: { ...controllerFor(sessionId).face.hooks, ...settingsFace.hooks } }),
+            directory: ctx.get("modelDirectories")?.directoryFor?.(sessionId)?.store,
+          }),
         }, EnhanceButtons);
       }), "@dsh-external/dsh-prompt-enhancer: input buttons");
       // 设置卡片(设置 → 内置插件 → 「提示词强化」Tab):0.2.x 起 settings.plugin.item
@@ -782,6 +1153,7 @@ window.__ModuleLoader__.load({
       // 免得用户看到一个永远空白的 Tab(与官方 ui-settings-* 的接线同构)。
       try {
         const settingsCard = settingsCardControllerFor(ctx);
+        settingsFace = settingsCard.face;
         ctx.effect(() => ctx.configForms.whileServed([SETTINGS_NS], () => ctx.slots.inject("settings.plugins.tab", () => ctx.slots.register({
           name: "settings.plugins.tab",
           id: SETTINGS_NS,

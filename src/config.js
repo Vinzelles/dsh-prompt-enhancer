@@ -29,7 +29,7 @@ try {
 } catch { /* schemastery 不可解析:Config 退化为 undefined,插件仍可加载 */ }
 
 /** 需要从 config 里取出的键(与下面 schema 字段一一对应)。 */
-export const CONFIG_KEYS = ["model", "intensity", "outputEnglish"];
+export const CONFIG_KEYS = ["model", "intensity", "outputEnglish", "nextSuggestion"];
 
 /** 设置面板字段顺序即此处声明顺序。
  *  model 用 .default(null) 而非 .required(false):后者在对象字段上不生效,
@@ -48,6 +48,8 @@ export const Config =
         intensity: Schema.union(["low", "medium", "high"]).default("medium").volatile(),
         // 转换英文开关:开启后无论输入什么语言,强化结果都输出为英文提示词。
         outputEnglish: Schema.boolean().default(false).volatile(),
+        // 下一轮建议:一轮结束后在空输入框给出灰字草稿。默认关,避免额外模型调用。
+        nextSuggestion: Schema.boolean().default(false).volatile(),
       });
 
 /** 把 apply(ctx, config) 收到的配置折叠成普通值:

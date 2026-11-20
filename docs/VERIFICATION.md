@@ -4,15 +4,15 @@
 2. 点击强化 → 图标转 spinner → 输入卡片出现加载遮罩（含「取消」按钮，输入被锁定）→ 草稿被增强文本替换（手动发送）。
 3. 强化成功后出现「还原」；点击还原草稿回退原文且还原消失。
 4. 手动编辑草稿 / 发送消息后还原消失（严格触发）。
-5. 强化期间点「取消」：遮罩消失、草稿保持原文、host 端子代理被中止。
+5. 强化期间点「取消」：遮罩消失、草稿保持原文、host 端直调请求被中止。
 6. 参考文件清单均为真实存在的文件（路径臆造会被自动剔除）；无仓库/零命中时无该节（静默降级）。
 7. 失败/超时 toast 提示，原文保留，可重试。
-8. 设置 → 内置插件 → Tab「提示词强化」出现设置表单：模型下拉含「跟随会话默认」+ 全部 provider/模型/思考强度；强度三档可切换；保存写入 plugin config（`home/profiles/<profile>/cordis.patch.yml` 中 `id: prompt-enhancer` 的 `config` 段），`configForms` 写操作返回 `true`（宿主拒绝时为 `false`，卡片置保存失败态而不抛异常）。
+8. 设置 → 内置插件 → Tab「提示词强化」出现设置表单：模型下拉含「跟随会话默认」+ 宿主选择器同源的 provider/模型/思考强度（含 workbuddy、openai-codex 等插件模型）；diag 不得出现 `settings-card-failed` / `remote.session`；强度三档可切换；保存写入 plugin config（`home/profiles/<profile>/cordis.patch.yml` 中 `id: prompt-enhancer` 的 `config` 段），`configForms` 写操作返回 `true`（宿主拒绝时为 `false`，卡片置保存失败态而不抛异常）。
 9. 强度设为「低」后强化：输出精简且不含「## 参考文件」节；「中」仅列参考路径；「高」恢复完整引用（路径 + 说明）。
 10. 配置专用模型后强化：diag log `enhance-start` 的 `model` 字段与宿主 `debug-stream.log` 的 `buildRequest done: provider=..., model=...` 显示该模型。
-11. 运行在非标准 agent 预设上的会话点击强化不报错（2026-08-21 回归）：父预设首轮机制与子会话不兼容时（diag log `enhance-child-no-text` 后出现 `enhance-child-retry-bare`），无预设子会话自动重试成功，toast 不再出现「LLM 无输出」；标准/code 等无首轮机制预设首轮即成功（无 retry 记录）。
+11. 运行在非标准 agent 预设上的会话点击强化不报错（2026-11-13 修订）：线上强化不再创建子会话，因此父预设首轮机制不再作用于强化路径；点强化只走 `ctx.llm.stream`，toast 不再因 `enhance-child-no-text` 出现「LLM 无输出」。旧的裸子会话重试记录仅保留在未调用的通道 B 实现与单测中。
 13. 访问控制（2026-08-27）：非本机来源（非 `127.0.0.1`/`::1`/`::ffff:127.0.0.1`）调用 `/prompt-enhancer`、`/prompt-enhancer/models`、`/prompt-enhancer/diag` 任一端点，立即 403 且不执行业务逻辑（diag log 落 `foreign-request-rejected` 信标含来源地址）；本机来源一切行为正常（1–12 项全部成立）。缺失 socket 信息按非本机处理（fail-closed）。
-14. 截断检测（2026-08-27）：任一通道输出被 maxTokens 截断时——通道 A（llm 直调）捕获 finish 块 `reason.kind === "max-tokens"`；通道 B（子会话）由 `childOutputTruncated` 判定最终文本来源步的 finish 块——响应 JSON 携带 `truncated: true`，UI 弹显式告警 toast（增强稿仍替换、「还原 ↺」可用），host 落 `enhance-truncated` 信标（含通道与草稿长度）、client 落同名信标。未截断时响应无 `truncated` 字段、UI 无告警（1–13 项行为不变）。
+14. 截断检测（2026-08-27，2026-11-13 修订为线上仅通道 A）：直调输出被 maxTokens 截断时捕获 finish 块 `reason.kind === "max-tokens"`——响应 JSON 携带 `truncated: true`，UI 弹显式告警 toast（增强稿仍替换、「还原 ↺」可用），host 落 `enhance-truncated` 信标（`channel: "llm"` 与草稿长度）、client 落同名信标。未截断时响应无 `truncated` 字段、UI 无告警（1–13 项行为不变）。通道 B 的 `childOutputTruncated` 仍保留在源码与单测中，线上强化不再走。
 15. 草稿上限与意图分类（2026-08-27）：草稿超过 200000 字符时端点立即 400（错误信息含上限值，diag log 落 `enhance-draft-too-long`），不发起任何 LLM 调用；恰好 200000 字符正常处理。persona 规则 10（意图先行）：增强稿按意图类别组织（排查/实现/解释/简单问答四分类），缺关键背景时不发明事实而是写「结合项目代码/日志确认……」，一句话多问题拆编号子问题，原话已完整清晰时只做最小必要改写。
 16. 转换英文开关（2026-09-05）：设置 → 内置插件 → Tab「提示词强化」出现「转换英文」开关（默认关）。开启后强化：输出全部为英文（参考文件节标题为 `## Reference Files`；skill 引用丢失时宿主确定性回填的节标题为 `## Skill References`）；路径存在性校验、中档压缩（只留路径）、低档剥离（整节删除）对英文标题同样生效（臆造路径照常剔除）；skill 引用记号、文件路径原样保留不翻译；关闭时行为与 1–15 项完全一致（输出跟随输入语言）。diag log `enhance-start` 携带 `outputEnglish` 字段。
 17. 双代宿主身份契约—版本（2026-09-07 回归）：宿主 0.1.1（descriptor v2）与 0.1.2+（v3）下点击强化，diag log `descriptor-version-resolved` 的 `version` 与该宿主 dsh-subagent 的 `SUBAGENT_DESCRIPTOR_VERSION` 一致、`channel` 记录解析通道（import / scan / package-version / 缺省 pin）。在 0.1.1 宿主机上把插件临时改回硬编码 `version: 2` 会复现损坏（旧行为），改回 `descriptorVersion` 即恢复——本项保证「兼容当前宿主且不砸老宿主」。**注（2026-09-12 修正）**：本项此前声称「子会话均正常显示 one-shot 子代理身份、不出现会话记录损坏」，实际并未验证——它只锚了载荷形状，没锚载荷是否落盘。当时的落点（`childCtx.agent.session.append`）在任何一代宿主上都不成立，线上之所以还在写 descriptor（08-21~09-10 共 69 个子会话）是因为部署目录跑的是另一份手工同步的产物；09-11 迁移把产物刷回提交形态后归零。损坏的完整判定与取证见第 19 项与 ADR-0004。

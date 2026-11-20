@@ -4,7 +4,7 @@
 
 DSH(DeepSeek Harness)提示词增强插件。在聊天输入框右侧加两个按钮：
 
-- **强化 ✦**：把当前草稿交给一个隔离的后台 agent——它会带上你的对话上下文、自己去仓库里 glob/grep 定位真正相关的文件——重写成结构清晰、约束明确、拿去就能用的任务提示词（末尾附经过存在性校验的「参考文件」清单），替换输入框草稿。**不自动发送、不进主对话历史**，改完你过目再发。
+- **强化 ✦**：把当前草稿连同对话上下文交给同模型直调（不创建子会话、不检索仓库）——重写成结构清晰、约束明确、拿去就能用的任务提示词（末尾可附经过存在性校验的「参考文件」清单；直调没有文件工具，编造路径会被剔除），替换输入框草稿。**不自动发送、不进主对话历史**，改完你过目再发。
 - **还原 ↺**：反悔了？一键退回强化前的原文。手动编辑过草稿或消息已发出时自动消失，不打扰。
 
 ## 安装
@@ -28,12 +28,11 @@ dsh plugin --profile web add github:Vinzelles/dsh-prompt-enhancer
 
 0.2.x 相对 0.1.x 有三处承重变化，本插件均已按新契约重写：
 
-- **设置面板**：`installSettingsSection` / `settingsNamespace` / `ctx.settings.installSection` 在 0.2.x 全部移除，官方通道改为「插件导出 `Config` schema（可调字段标 `.volatile()`）+ profile patch 落配置」。面板表单由宿主 `dsh-settings` 从 `entry.fiber.runtime.Config` 反投影生成，命名空间即 profile patch 的 entry id（本插件为 `prompt-enhancer`）；未标 volatile 的字段不会出现在面板里。插件把三个可调项（`model` / `intensity` / `outputEnglish`）声明为 volatile 字段，`apply(ctx, config)` 的第二参即校验后的配置；volatile 值运行时以引用对象（`{get()}`）下发，插件逐键取值，改设置即时生效、无需重启。
+- **设置面板**：`installSettingsSection` / `settingsNamespace` / `ctx.settings.installSection` 在 0.2.x 全部移除，官方通道改为「插件导出 `Config` schema（可调字段标 `.volatile()`）+ profile patch 落配置」。面板表单由宿主 `dsh-settings` 从 `entry.fiber.runtime.Config` 反投影生成，命名空间即 profile patch 的 entry id（本插件为 `prompt-enhancer`）；未标 volatile 的字段不会出现在面板里。插件把四个可调项（`model` / `intensity` / `outputEnglish` / `nextSuggestion`）声明为 volatile 字段，`apply(ctx, config)` 的第二参即校验后的配置；volatile 值运行时以引用对象（`{get()}`）下发，插件逐键取值，改设置即时生效、无需重启。
 - **客户端设置槽位**：`settings.plugin.item` 槽位与 `settingsScope` 客户端服务在 0.2.x 均已移除。设置卡片改走 `ctx.configForms.get("prompt-enhancer")`（`ConfigFormController`：`getSnapshot` / `subscribe` / `set` / `unset` / `mutate`，写操作返回 `Promise<boolean>`——宿主拒绝时是 `false` 而非抛异常）+ `settings.plugins.tab` 槽位（注册项用 `id` + `label`，不再是 `key`）。输入框按钮所在槽位 `conversation.input.right` 未变。
 - **宿主依赖树定位**：裸 `@deepseek-ai/*` import 的解析规则改为「插件 `package.json` 的 `peerDependencies` 必须声明该包名」；插件按「profile node_modules → `DSH_HOME` 上溯 → 包自身上溯 → 宿主 bin（`process.argv[1]`）上溯 → 扫 `%APPDATA%` 下所有含 `dependencies/dsh/node_modules` 的发行版目录 → `.pnpm` store」逐级探测宿主包目录，桌面端目录名（如 `dsh-tauri`）不再写死。
 
-强化子会话依赖宿主的子代理身份契约（`subagent/descriptor`）：身份事件缺失或版本不匹配，子会话都会被宿主判为「会话记录损坏」。本插件不写死该契约——① **版本**：加载时从宿主依赖树的 `@deepseek-ai/dsh-subagent` 动态解析真实契约（读常量 → 文件扫描 → 包版本 semver 推断三级兜底），0.2.1-rc.2 下解析为 `3`（通道 `import`，取自宿主 `lib/types/descriptor.js`）；② **落点**：身份事件写在 Agent 实例上（setup 第二参，退化时用 `agent/pre-step` 载荷里的 `agent`），与官方子代理驱动同形——ctx 上并不存在 `agent` 服务（服务名是 `agents`），写错落点会静默丢失整条身份事件。追加结果在 `~/.dsh/super-injector/prompt-enhancer-diag.log` 可见（`enhance-child-ready` / `enhance-child-descriptor-final` 的 `descriptorAppended` / `descriptorPath` / `descriptorEvents`），身份未落盘时另有 `enhance-child-descriptor-unarmed` 信标，不会退化成 UI 里一句「会话记录损坏」。
-
+线上强化走模型直调，不再创建子会话，因此也不会再出现「会话记录损坏」的强化子代理行。仓库里仍保留隔离子会话实现与身份契约解析（`subagent/descriptor` 版本随宿主 dsh-subagent 动态解析、落点必须是 Agent 实例），供既有单测切片，运行路径不再调用。
 ## 强化程度与模型
 
 设置 → 内置插件 → Tab「提示词强化」：
@@ -49,12 +48,14 @@ dsh plugin --profile web add github:Vinzelles/dsh-prompt-enhancer
 
 另有「**转换英文**」开关（默认关）：开启后无论输入什么语言，强化结果都会自动输出为英文提示词（参考文件节标题变为 `## Reference Files`，需要兜底回填的技能引用节为 `## Skill References`）；skill 引用记号、文件路径与专有名词保持原样不翻译，参考文件的存在性校验照常生效。关闭则保持默认行为（输出跟随输入语言）。
 
+「**下一轮建议**」也默认关闭。打开后，一轮回复结束且输入框为空、聚焦时，会用灰字给出一条可继续发送的草稿；按 Tab 或点右侧 Tab 只填入草稿，不自动发送。开始打字即隐藏，删空后同一条建议再出现，不重复调用模型；Esc 则藏到下一轮结束。它只走模型直调，不建子会话、不检索仓库。
+
 ## 值得信任的地方
 
-- **零污染**：强化在隔离子会话里跑完即销毁，主对话历史干干净净；子会话失败自动降级为模型直调，再失败保留原文并 toast 提示，可重试。
+- **零污染**：强化只走模型直调，主对话历史干干净净；失败保留原文并 toast 提示，可重试。
 - **不瞎编路径**：参考文件清单逐行校验存在性，臆造路径自动剔除；没有仓库或检索零命中时静默省略该节。
 - **引用不丢**：草稿里的 skill 引用记号（`/tdd`、`/code-review` 这类）强化后原样保留——模型改写意外丢失时自动以「## 技能引用」节补回，发送后技能照常生效。
-- **可中止**：强化期间输入卡片盖上加载遮罩、锁定编辑；点「取消」立即中止后台子代理，草稿保持原文。
+- **可中止**：强化期间输入卡片盖上加载遮罩、锁定编辑；点「取消」立即中止直调请求，草稿保持原文。
 
 ## 故障排查
 

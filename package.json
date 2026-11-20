@@ -1,7 +1,7 @@
 {
   "name": "@dsh-external/dsh-prompt-enhancer",
-  "version": "0.1.4",
-  "description": "提示词增强插件:输入框注入强化/还原图标,后台调用隔离 agent 结合对话上下文与仓库知识重写提示词,替换草稿文本(保留 skill 引用记号)",
+  "version": "0.1.7",
+  "description": "提示词增强插件:输入框注入强化/还原图标,后台直调模型结合对话上下文重写提示词,替换草稿文本(保留 skill 引用记号)",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -31,7 +31,8 @@
         "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-settings"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-model-selection"
       ]
     }
   },
@@ -43,13 +44,14 @@
     "@deepseek-ai/dsh-client-ui-slots": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-client-ui-conversation": "^0.2.0-rc.2",
     "@deepseek-ai/dsh-client-locale": "^0.2.0-rc.2",
-    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.2"
+    "@deepseek-ai/dsh-client-ui-settings": "^0.2.0-rc.2",
+    "@deepseek-ai/dsh-client-ui-model-selection": "^0.2.0-rc.2"
   },
   "scripts": {
     "build": "node scripts/build.mjs",
     "build:client": "node scripts/build-client.mjs",
-    "test": "node --test tests/loopback.test.mjs && node --test tests/truncation.test.mjs && node --test tests/limits.test.mjs && node --test tests/english-output.test.mjs && node tests/skill-ref.test.mjs && node tests/descriptor-version.test.mjs && node --test tests/descriptor-append.test.mjs && node --test tests/client-store-resolution.test.mjs && node --test tests/promo-copy-check.test.mjs",
-    "test:unit": "node --test tests/loopback.test.mjs && node --test tests/truncation.test.mjs && node --test tests/limits.test.mjs && node --test tests/english-output.test.mjs && node tests/skill-ref.test.mjs && node tests/descriptor-version.test.mjs && node --test tests/descriptor-append.test.mjs && node --test tests/client-store-resolution.test.mjs",
+    "test": "node --test tests/loopback.test.mjs && node --test tests/truncation.test.mjs && node --test tests/limits.test.mjs && node --test tests/english-output.test.mjs && node tests/skill-ref.test.mjs && node tests/descriptor-version.test.mjs && node --test tests/descriptor-append.test.mjs && node --test tests/client-store-resolution.test.mjs && node --test tests/promo-copy-check.test.mjs && node --test tests/next-suggestion.test.mjs && node --test tests/suggestion-state.test.mjs && node --test tests/catalog-sync.test.mjs",
+    "test:unit": "node --test tests/loopback.test.mjs && node --test tests/truncation.test.mjs && node --test tests/limits.test.mjs && node --test tests/english-output.test.mjs && node tests/skill-ref.test.mjs && node tests/descriptor-version.test.mjs && node --test tests/descriptor-append.test.mjs && node --test tests/client-store-resolution.test.mjs && node --test tests/next-suggestion.test.mjs && node --test tests/suggestion-state.test.mjs && node --test tests/catalog-sync.test.mjs",
     "test:promo-copy": "node --test tests/promo-copy-check.test.mjs"
   }
 }

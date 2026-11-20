@@ -5,17 +5,13 @@
  * 服务端结合有界对话窗口 + 会话工作目录(仓库知识),把原始提示词
  * 重写为结构化的 agent 任务提示词并附参考文件清单。
  *
- * 执行通道(ADR-0001,2026-08-21 修订:通道 B 二级降级):
- *   通道 B(主):隔离子会话 agent(composeFrom 继承父会话预设组合 + 只读工具限制 +
- *              强化专用 persona),完整 agent 循环,结果回传后 dispose,不污染主对话历史。
- *              父预设若携带与全新子会话首轮不兼容的机制(如 router 预设 bootstrap
- *              要求平台 shell 在目录中,而只读限制已将其移除→首轮 turn 错误无文本),
- *              退化为不 join 预设的裸子会话重试一次(纯改写、无文件检索)。
- *   通道 A(降级):ctx.llm.stream 直调,同一 persona 与 payload。
+ * 执行通道(ADR-0001,2026-11-13 修订:通道 A 为主):
+ *   通道 A(主):ctx.llm.stream 直调,同一 persona 与 payload,不创建子会话、不检索仓库。
+ *   通道 B(保留未调用):隔离子会话 agent 实现仍在本文件,供既有单测切片;线上强化不再走它。
  *
  * 决策基线(grill 会话共识,详见 CONTEXT.md):
  *   窗口 ~8k token(24000 字符预算)/ 参考文件 top-5 / 摘录 ≤2 篇 × ≤20 行 /
- *   通道 B 超时 90s / 通道 A 超时 60s / 保持输入语言(或「转换英文」开关开启时
+ *   通道 A 超时 60s / 保持输入语言(或「转换英文」开关开启时
  *   统一英文输出)/ 软长度约原文 2 倍。
  *
  * Skill 引用保留(2026-08-22):原始提示词中的 `/skill-name` 记号是宿主技能
@@ -28,6 +24,7 @@
 const ENDPOINT = "/prompt-enhancer";
 const MODELS_ENDPOINT = "/prompt-enhancer/models";
 const DIAG_ENDPOINT = "/prompt-enhancer/diag";
+const SUGGESTION_ENDPOINT = "/prompt-enhancer/suggestion";
 const CHILD_TIMEOUT_MS = 90_000;
 const FALLBACK_TIMEOUT_MS = 60_000;
 const CONTEXT_CHAR_BUDGET = 24_000; // ≈8k token 混合中英
@@ -257,7 +254,7 @@ try {
  * 因此这里不再注册任何 schema:hooks 形态的 installSection 已经不存在了。 */
 
 const SETTINGS_NS = "prompt-enhancer";
-const SETTINGS_DEFAULTS = { intensity: "medium", outputEnglish: false };
+const SETTINGS_DEFAULTS = { intensity: "medium", outputEnglish: false, nextSuggestion: false };
 
 /** 每个插件实例(apply 的 ctx)自己的配置源。
  *  volatile 字段必须每次重新读 ref,用户改设置才会即时生效;用 WeakMap 而不是
@@ -279,6 +276,7 @@ function enhanceConfig(ctx) {
   }
   const intensity = value.intensity === "low" || value.intensity === "high" ? value.intensity : "medium";
   const outputEnglish = value.outputEnglish === true;
+  const nextSuggestion = value.nextSuggestion === true;
   const modelValue = value.model;
   const model =
     modelValue !== null && typeof modelValue === "object" &&
@@ -293,7 +291,7 @@ function enhanceConfig(ctx) {
               : undefined,
         }
       : undefined;
-  return { intensity, model, outputEnglish };
+  return { intensity, model, outputEnglish, nextSuggestion };
 }
 
 function diagLog(stage, detail) {
@@ -324,8 +322,8 @@ function enhancerPersona(outputEnglish) {
       ? "3. 结构建议(按需选用,不要机械套用,全部用英文书写):Goal / Context (if any) / Steps / Constraints / Acceptance criteria."
       : "3. 结构建议(按需选用,不要机械套用):目标 / 背景(如有) / 步骤 / 约束 / 验收标准。",
     "4. 长度软约束:通常不超过原文的 2 倍;不要为凑结构注水。",
-    "5. 仓库知识:若当前工作目录存在,用 glob/grep/read 等只读工具基于原始提示词的关键词,有界地定位 ≤5 个最相关文件(优先 README、docs、架构说明、规则文件,其次直接相关的源码);不要遍历全仓。",
-    "6. 参考文件清单:在输出末尾加「" + refsHeading + "」一节," + refsLine + "只列你实际用 glob/grep/read 打开并确认存在的文件,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);未找到相关文件或没有工作目录时省略该节。",
+    "5. 仓库知识:你没有文件工具,不要假装做过 glob/grep/read。若任务或对话里已经出现真实路径,可把它们列入参考文件;否则宁可省略该节,也不要编造仓库结构。",
+    "6. 参考文件清单:在输出末尾加「" + refsHeading + "」一节," + refsLine + "只列你有把握存在的相对路径,禁止臆测或猜测路径(宿主会自动校验并剔除不存在的路径);没有工作目录、对话里也没有真实路径时省略该节。",
     "7. 摘录:最多对 2 个「高相关且短」的文件在清单后附 ≤20 行关键摘录;其余文件只给路径与说明。",
     "8. 输出格式:只输出改写后的提示词本身(含参考文件节);禁止输出任何解释、前言、确认语或代码围栏。",
     "9. Skill引用:原始提示词中的 /skill-name 形式记号是宿主平台的技能(skill)调用语法,发送后由宿主识别并注入技能全文——它们不是普通文字。必须原样保留原始提示词中的每一个这类记号(连斜杠一起逐字符照抄,可融入正文或集中放在「" + skillHeading + "」节);禁止翻译、禁止改写成描述性词语(如把 /tdd 写成「TDD 流程」)、禁止加代码围栏、禁止删除。",
@@ -364,11 +362,16 @@ export function apply(ctx, config) {
     path: MODELS_ENDPOINT,
     handler: (request, response) => handleModels(ctx, request, response),
   }), "dsh-prompt-enhancer: models route");
+  ctx.effect(() => ctx.webServer.register({
+    kind: "exact",
+    path: SUGGESTION_ENDPOINT,
+    handler: (request, response) => handleSuggestion(ctx, request, response),
+  }), "dsh-prompt-enhancer: suggestion route");
   // 诊断信标:客户端各执行阶段回传,落盘供排障(临时埋点,稳定后可移除)
   ctx.effect(() => ctx.webServer.register({
     kind: "exact",
     path: DIAG_ENDPOINT,
-handler: (request, response) => {
+    handler: (request, response) => {
       if (!isLoopbackRequest(request)) {
         rejectForeign(request, response);
         return;
@@ -387,7 +390,7 @@ handler: (request, response) => {
 /* ═══════════════ HTTP ═══════════════ */
 
 /** 回环来源白名单(fail-closed:其余地址——含缺失 socket——一律拒绝)。
- *  DSH web 服务经局域网/隧道/反代暴露时(远程使用常见),三端点不得被非本机
+ *  DSH web 服务经局域网/隧道/反代暴露时(远程使用常见),各 HTTP 端点不得被非本机
  *  来源触达:enhance 端点可借任意 sessionId 触发子代理在用户仓库做检索并
  *  消耗 LLM 额度;diag/models 泄漏本机信息。非本机来源 → 403 立即拒绝。 */
 const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -463,30 +466,21 @@ async function handleRoute(ctx, request, response) {
     const payload = buildPayload(draft, context, cwd, cfg.intensity, referencedSkills, cfg.outputEnglish);
     const persona = enhancerPersona(cfg.outputEnglish);
 
-    // 截断标记:两通道输出都可能被 maxTokens 截断;截断时 UI 显式告警
+    // 截断标记:直调输出可能被 maxTokens 截断;截断时 UI 显式告警
     // (草稿仍替换、还原入口可用)——截断损坏的提示词不得静默覆盖输入框
     let truncated = false;
-    let channel = "child";
+    const channel = "llm";
     let enhanced;
     try {
-      const result = await enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, aborted.signal, cfg.model, persona);
+      const result = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model, persona);
       enhanced = result.text;
       truncated = result.truncated === true;
     } catch (error) {
       if (aborted.signal.aborted) {
         diagLog("enhance-aborted", { sessionId });
-        return; // 客户端已离开,响应无意义,不降级
+        return; // 客户端已离开,响应无意义
       }
-      diagLog("enhance-channel-b-failed", {
-        sessionId,
-        message: String(error?.message ?? error),
-        stack: String(error?.stack ?? "").slice(0, 800),
-      });
-      ctx.logger?.warn("[dsh-prompt-enhancer] 通道 B(子会话)失败,降级通道 A(llm 直调): " + String(error));
-      channel = "llm";
-      const result = await enhanceWithLlm(ctx, route, payload, aborted.signal, cfg.model, persona);
-      enhanced = result.text;
-      truncated = result.truncated === true;
+      throw error;
     }
     // 防臆造路径:参考清单逐行校验存在性
     const sanitized = sanitizeReferences(enhanced, cwd);
@@ -525,6 +519,83 @@ async function handleRoute(ctx, request, response) {
   }
 }
 
+async function suggestNext(ctx, route, context, signal, modelCfg) {
+  let text = "";
+  const provider = modelCfg?.provider ?? route.provider;
+  const model = modelCfg?.model ?? route.model;
+  const reasoningEffort = modelCfg?.reasoningEffort ?? (modelCfg === undefined ? route.reasoningEffort : undefined);
+  const stream = ctx.llm.stream({
+    provider,
+    model,
+    system: suggestionPersona(),
+    messages: [userMessage("【最近对话】\n" + context + "\n\n只输出用户的下一条消息。")],
+    temperature: 0.2,
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    ...(signal !== undefined ? { signal } : {}),
+  });
+  const consume = (async () => {
+    for await (const chunk of stream) {
+      if (chunk?.type === "text-delta" && typeof chunk.text === "string") text += chunk.text;
+      if (chunk?.type === "finish" && chunk.reason?.kind === "error") {
+        throw new Error(chunk.reason?.failure?.message ?? "LLM 调用失败");
+      }
+    }
+  })();
+  await withTimeout(consume, FALLBACK_TIMEOUT_MS, undefined);
+  return normalizeSuggestion(text);
+}
+
+async function handleSuggestion(ctx, request, response) {
+  if (!isLoopbackRequest(request)) {
+    rejectForeign(request, response);
+    return;
+  }
+  const aborted = new AbortController();
+  const onAbort = () => {
+    if (!response.writableEnded) aborted.abort(new Error("客户端已断开"));
+  };
+  response.on("close", onAbort);
+  request.on("aborted", onAbort);
+  try {
+    if (request.method !== "POST") {
+      respondJson(response, 405, { error: "仅支持 POST" });
+      return;
+    }
+    const cfg = enhanceConfig(ctx);
+    if (cfg.nextSuggestion !== true) {
+      respondJson(response, 200, { suggestion: "", disabled: true });
+      return;
+    }
+    const body = await requestJson(request);
+    const sessionId = typeof body.sessionId === "string" && body.sessionId !== "" ? body.sessionId : null;
+    const turn = Number.isInteger(body.turn) ? body.turn : null;
+    if (sessionId === null || turn === null) {
+      respondJson(response, 400, { error: "sessionId 与 turn 为必填项" });
+      return;
+    }
+    const context = suggestionContext(body.messages);
+    if (context.trim() === "") {
+      respondJson(response, 200, { suggestion: "" });
+      return;
+    }
+    const source = await readSource(ctx, sessionId);
+    const route = await routeOf(ctx, sessionId, source.events);
+    diagLog("suggestion-start", { sessionId, turn, chars: context.length, model: cfg.model ?? null });
+    const suggestion = await suggestNext(ctx, route, context, aborted.signal, cfg.model);
+    if (aborted.signal.aborted) return;
+    diagLog("suggestion-done", { sessionId, turn, length: suggestion.length });
+    respondJson(response, 200, { suggestion });
+  } catch (error) {
+    if (aborted.signal.aborted) return;
+    const message = error instanceof Error ? error.message : String(error);
+    diagLog("suggestion-failed", { message });
+    respondJson(response, error instanceof TypeError ? 400 : 502, { error: message });
+  } finally {
+    request.off("aborted", onAbort);
+    response.off("close", onAbort);
+  }
+}
+
 function requestJson(request) {
   return new Promise((resolve, reject) => {
     let text = "";
@@ -553,6 +624,21 @@ function respondJson(response, status, value) {
 
 /* ═══════════════ 模型目录(设置卡片数据源) ═══════════════ */
 
+/** 与宿主选择器同源:listProviders(可路由)为主,listConfigurableProviders 补尚未出现在路由表里的插件 provider。 */
+function catalogProviderInfos(llm) {
+  const seen = new Map();
+  const add = (id, name) => {
+    if (typeof id !== "string" || id === "") return;
+    if (seen.has(id)) return;
+    seen.set(id, { id, name: typeof name === "string" && name !== "" ? name : id });
+  };
+  const listed = typeof llm?.listProviders === "function" ? llm.listProviders() : [];
+  for (const provider of listed) add(provider?.id, provider?.name);
+  const configurable = typeof llm?.listConfigurableProviders === "function" ? llm.listConfigurableProviders() : [];
+  for (const entry of configurable) add(entry?.provider, entry?.displayName);
+  return [...seen.values()];
+}
+
 /** GET /prompt-enhancer/models:枚举已配置 provider 及其模型(含思考强度目录)。
  *  形状与 dsh-host-apiproxy 的 buildModelCatalog 一致,便于 client 直接消费。 */
 async function handleModels(ctx, request, response) {
@@ -565,7 +651,7 @@ async function handleModels(ctx, request, response) {
       respondJson(response, 405, { error: "仅支持 GET" });
       return;
     }
-    const providers = typeof ctx.llm?.listProviders === "function" ? ctx.llm.listProviders() : [];
+    const providers = catalogProviderInfos(ctx.llm);
     const catalog = await Promise.all(providers.map(async (provider) => {
       try {
         const models = await ctx.llm.listModels(provider.id);
@@ -727,7 +813,7 @@ function textOfBlocks(blocks) {
 function buildPayload(draft, context, cwd, intensity, skills = [], outputEnglish = false) {
   const parts = [];
   if (typeof cwd === "string" && cwd !== "") {
-    parts.push("【工作目录】\n" + cwd + "\n(参考文件路径一律使用相对该目录的路径;检索只用 glob/grep/read,不要遍历全仓。)");
+    parts.push("【工作目录】\n" + cwd + "\n(参考文件路径一律使用相对该目录的路径。你没有 glob/grep/read 工具,不要假装检索过仓库;不确定的路径不要写进参考文件节,宿主会剔除不存在的路径。)");
   } else {
     parts.push("【工作目录】\n不可用——当前会话没有绑定工作目录。跳过仓库检索,不要编造任何文件路径,只做纯改写。");
   }
@@ -999,10 +1085,13 @@ function sessionEvents(session) {
  * 不会作用于它,退化为纯改写)。fatal 错误(超时/客户端取消)以 error.fatal 标记,
  * 调用方不应重试;无文本/回合错误可重试。 */
 async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, signal, modelCfg, joinPreset, persona) {
-  // 配置了专用模型:agentOptions 覆盖 provider/model;effort 经 agent/request waterfall 注入
-  // (agent-loop 的 buildRequest 只从会话 header 继承 effort,子会话 header 无此配置)。
+  // 0.2.2 在准备步骤时固定完整模型选择;请求 waterfall 不再允许改 provider/model/effort。
   const effectiveProvider = modelCfg?.provider ?? route.provider;
   const effectiveModel = modelCfg?.model ?? route.model;
+  // 专用模型未设 effort 时交给其适配器默认值,不继承父模型的 effort。
+  const effectiveEffort = modelCfg === undefined
+    ? route.reasoningEffort
+    : (typeof modelCfg.reasoningEffort === "string" && modelCfg.reasoningEffort !== "" ? modelCfg.reasoningEffort : undefined);
   const childId = "session-" + globalThis.crypto.randomUUID();
   let descriptorInstall;
   const setup = (childCtx, child) => {
@@ -1041,24 +1130,6 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
         ctx.logger?.warn("[dsh-prompt-enhancer] tools.restrict 失败(退化:无工具限制): " + String(error));
       }
     }
-    // 专用模型 + 思考强度:waterfall 覆盖请求配置(与 installModelSelection 同法)
-    if (modelCfg !== undefined) {
-      try {
-        childCtx.on?.("agent/request", async (_payload, next) => {
-          const resolved = await next();
-          return {
-            ...resolved,
-            provider: modelCfg.provider,
-            model: modelCfg.model,
-            ...(typeof modelCfg.reasoningEffort === "string" && modelCfg.reasoningEffort !== ""
-              ? { reasoningEffort: modelCfg.reasoningEffort }
-              : {}),
-          };
-        });
-      } catch (error) {
-        ctx.logger?.warn("[dsh-prompt-enhancer] agent/request waterfall 注入失败(退化:子会话用继承模型): " + String(error));
-      }
-    }
   };
   // 与官方 childSessionMeta 同构:origin/父会话/委派深度(父深度+1,父不可用按顶层 0 计)。
   const parentDepth = parent?.session?.header?.delegationDepth ?? 0;
@@ -1071,7 +1142,7 @@ async function runEnhanceChild(ctx, parent, route, cwd, payload, sessionId, sign
     agentOptions: {
       provider: effectiveProvider,
       model: effectiveModel,
-      ...(route.reasoningEffort !== undefined && modelCfg === undefined ? { reasoningEffort: route.reasoningEffort } : {}),
+      ...(effectiveEffort !== undefined ? { reasoningEffort: effectiveEffort } : {}),
       ...(route.maxTokens !== undefined ? { maxTokens: route.maxTokens } : {}),
     },
     setup,
@@ -1177,7 +1248,7 @@ async function enhanceWithChildAgent(ctx, route, cwd, payload, sessionId, signal
 async function waitForTurn(agent, timeoutMs, signal, label) {
   const cancel = (reason) => {
     try {
-      agent.cancel(new Error(label + "中止: " + reason));
+      agent.cancel({ kind: "hook", reason: label + "中止: " + reason });
     } catch { /* cancel 失败随 dispose 收敛 */ }
   };
   let timer;
@@ -1300,6 +1371,59 @@ function userMessage(text) {
     content: [{ type: "text", text }],
     source: { kind: "user" },
   };
+}
+
+/* ═══════════════ 下一轮建议(通道 A 直调,不建子会话) ═══════════════ */
+
+const SUGGESTION_MESSAGE_CAP = 12;
+const SUGGESTION_CHAR_CAP = 600;
+
+function suggestionPersona() {
+  return [
+    "你是对话续写助手。根据最近一轮已经结束的对话,写出用户最可能接着发送的一条消息。",
+    "只输出这一条消息本身,不要标题、编号、引号、解释或备选。",
+    "用对话里用户正在使用的语言。保持具体、可执行,不要复述助手刚刚说过的话,也不要替助手回答。",
+    "没有有用的下一步时输出空字符串。长度不超过 " + SUGGESTION_CHAR_CAP + " 个字符。",
+  ].join("\n");
+}
+
+function suggestionContext(messages) {
+  if (!Array.isArray(messages)) return "";
+  const kept = [];
+  for (const message of messages) {
+    if (message === null || typeof message !== "object") continue;
+    const role = message.role === "user" ? "用户" : message.role === "assistant" ? "助手" : "";
+    const text = typeof message.text === "string" ? message.text.trim() : "";
+    if (role === "" || text === "") continue;
+    kept.push("[" + role + "] " + (text.length > CONTEXT_LINE_CAP ? text.slice(0, CONTEXT_LINE_CAP) + "…(已折叠)" : text));
+  }
+  const windowed = kept.slice(-SUGGESTION_MESSAGE_CAP);
+  let used = 0;
+  const parts = [];
+  for (let i = windowed.length - 1; i >= 0 && used < CONTEXT_CHAR_BUDGET; i -= 1) {
+    const room = CONTEXT_CHAR_BUDGET - used;
+    const line = windowed[i].length <= room ? windowed[i] : windowed[i].slice(0, room);
+    parts.unshift(line);
+    used += line.length;
+  }
+  return parts.join("\n");
+}
+
+function normalizeSuggestion(text) {
+  let value = cleanAssistantText(String(text ?? "")).trim();
+  value = value.replace(/^```[a-zA-Z0-9_-]*\n?/, "").replace(/\n?```$/, "").trim();
+  const fenced = value.match(/^`([^`]+)`$/);
+  if (fenced !== null) value = fenced[1].trim();
+  if ((value.startsWith("\"") && value.endsWith("\"")) || (value.startsWith("「") && value.endsWith("」"))) {
+    value = value.slice(1, -1).trim();
+  }
+  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "");
+  if (lines.length > 1 && lines.every((line) => /^(\d+[.)]|[-*])\s+/.test(line))) {
+    value = lines[0].replace(/^(\d+[.)]|[-*])\s+/, "");
+  }
+  value = value.replace(/\s+/g, " ").trim();
+  if (value.length > SUGGESTION_CHAR_CAP) value = value.slice(0, SUGGESTION_CHAR_CAP).trim();
+  return value;
 }
 
 async function withTimeout(promise, ms, onTimeout) {
